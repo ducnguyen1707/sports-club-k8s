@@ -1,0 +1,4 @@
+# never commit rendered secrets
+k8s/**/secret-*.yaml
+*.local.yaml
+.env

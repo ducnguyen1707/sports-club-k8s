@@ -1,0 +1,71 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+spec:
+  serviceName: mysql
+  replicas: 1              # see scale plan: horizontal MySQL is out of scope
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      containers:
+        - name: mysql
+          image: mysql:8.0
+          args:
+            # Dataset is ~7KB of schema. Default 128M buffer pool + the
+            # performance schema would waste ~300MB on a 4GB node.
+            - --innodb-buffer-pool-size=64M
+            - --performance-schema=OFF
+            - --skip-host-cache
+          env:
+            - name: MYSQL_DATABASE
+              value: sports_club_db        # matches db_conn.php default
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: mysql-credentials, key: root-password }
+            - name: MYSQL_USER
+              valueFrom:
+                secretKeyRef: { name: mysql-credentials, key: username }
+            - name: MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: mysql-credentials, key: password }
+          ports:
+            - containerPort: 3306
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+            - name: init
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits:   { cpu: 500m, memory: 640Mi }
+          livenessProbe:
+            exec: { command: ["mysqladmin", "ping", "-h", "127.0.0.1"] }
+            initialDelaySeconds: 45
+            periodSeconds: 15
+            timeoutSeconds: 5
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "mysqladmin ping -h 127.0.0.1 --silent"]
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 5
+      volumes:
+        - name: init
+          configMap:
+            name: mysql-init
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: longhorn
+        resources:
+          requests:
+            storage: 1Gi     # deliberately small — Longhorn has ~2Gi free on the worker

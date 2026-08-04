@@ -1,0 +1,55 @@
+# Identity used by CI to deploy. Deliberately namespace-scoped: if the token
+# leaks, the blast radius is the sports-club namespace and nothing else.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sports-club-deployer
+  namespace: sports-club
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sports-club-deployer
+  namespace: sports-club
+rules:
+  - apiGroups: [""]
+    resources: ["services", "configmaps", "persistentvolumeclaims", "pods", "pods/log", "pods/exec"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "replicasets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # NOTE: no "secrets" access. CI never needs to read DB credentials —
+  # the pods reference the Secret directly via secretKeyRef.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sports-club-deployer
+  namespace: sports-club
+subjects:
+  - kind: ServiceAccount
+    name: sports-club-deployer
+    namespace: sports-club
+roleRef:
+  kind: Role
+  name: sports-club-deployer
+  apiGroup: rbac.authorization.k8s.io
+---
+# k8s 1.24+ no longer auto-creates SA token Secrets; request one explicitly.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: sports-club-deployer-token
+  namespace: sports-club
+  annotations:
+    kubernetes.io/service-account.name: sports-club-deployer
+type: kubernetes.io/service-account-token

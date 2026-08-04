@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sports-club-app
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0        # never dip below current capacity during deploys
+  selector:
+    matchLabels: { app: sports-club-app }
+  template:
+    metadata:
+      labels: { app: sports-club-app }
+    spec:
+      # Spread replicas across nodes so one node loss doesn't take everything.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app: sports-club-app }
+      containers:
+        - name: app
+          image: ghcr.io/OWNER/sports-club:latest   # overwritten by CI
+          ports:
+            - containerPort: 80
+          env:
+            - name: DB_HOST
+              value: mysql
+            - name: DB_NAME
+              value: sports_club_db
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef: { name: mysql-credentials, key: username }
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: mysql-credentials, key: password }
+          resources:
+            requests: { cpu: 50m,  memory: 96Mi }
+            limits:   { cpu: 200m, memory: 256Mi }
+          readinessProbe:
+            httpGet: { path: /index.php, port: 80 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /index.php, port: 80 }
+            initialDelaySeconds: 20
+            periodSeconds: 20

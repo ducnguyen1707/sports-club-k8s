@@ -1,0 +1,17 @@
+# Build context hygiene — upstream repo is ~2.7MB, mostly docs we never ship.
+.git/
+.github/
+k8s/
+ci/
+README.md
+.upstream-commit
+
+# Documentation artifacts. NOTE: patterns need **/ to match nested paths —
+# a bare *.sql only matches the context root, not app/Files/.
+**/*.pdf
+**/*.pptx
+**/*.docx
+**/*.sql
+ER*DIAGRAM*
+Tables.png
+Description.txt

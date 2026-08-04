@@ -1,0 +1,149 @@
+name: build-and-deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref — saves runner time on rapid pushes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/sports-club
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Cheap gate first: php -l takes seconds and catches syntax errors before we
+  # spend a minute building a ~450MB image.
+  # ---------------------------------------------------------------------------
+  lint:
+    runs-on: ubuntu-latest
+    container: php:8.3-cli
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint vendored app + overrides
+        run: |
+          set -eu
+          fail=0
+          # Note: -print0/-0 because upstream has filenames with spaces
+          while IFS= read -r -d '' f; do
+            php -l "$f" >/dev/null || { echo "SYNTAX ERROR: $f"; fail=1; }
+          done < <(find app/Files docker/php-overrides -name '*.php' -print0)
+          [ "$fail" -eq 0 ] && echo "All PHP files parse cleanly."
+          exit "$fail"
+
+  # ---------------------------------------------------------------------------
+  # Manifests must render before we bother building an image.
+  # ---------------------------------------------------------------------------
+  validate-manifests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-kubectl@v4
+        with: { version: v1.35.6 }
+      - name: kustomize build
+        run: kubectl kustomize k8s/overlays/production > /dev/null && echo "manifests OK"
+
+  # ---------------------------------------------------------------------------
+  # Build on a GitHub-hosted runner: free (unlimited on public repos) and it's
+  # the CPU-heavy step, so there's no reason to spend our own cluster on it.
+  # ---------------------------------------------------------------------------
+  build:
+    needs: [lint, validate-manifests]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write        # GITHUB_TOKEN can push to GHCR — no PAT needed
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        run: echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+            ${{ env.IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ---------------------------------------------------------------------------
+  # Deploy. Requires KUBE_CONFIG secret — a kubeconfig for the NAMESPACE-SCOPED
+  # ServiceAccount (see README), not a cluster-admin one. If that credential
+  # leaks, the blast radius is the sports-club namespace only.
+  # ---------------------------------------------------------------------------
+  deploy:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    environment: production      # add required reviewers in repo settings for manual approval
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-kubectl@v4
+        with: { version: v1.35.6 }
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p "$HOME/.kube"
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+      # kubectl has kustomize BUILT IN, but not `kustomize edit` — that
+      # subcommand only exists in the standalone CLI, so install it.
+      - name: Install kustomize CLI
+        run: |
+          curl -sS "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+          sudo mv kustomize /usr/local/bin/
+          kustomize version
+
+      - name: Pin image tag in manifests
+        working-directory: k8s/overlays/production
+        run: |
+          kustomize edit set image \
+            "ghcr.io/OWNER/sports-club=${IMAGE}:${{ needs.build.outputs.tag }}"
+          echo "--- resulting image ---"
+          kustomize build . | grep 'image: ghcr.io'
+
+      - name: Apply
+        run: kubectl apply -k k8s/overlays/production
+
+      - name: Wait for rollout
+        run: |
+          kubectl -n sports-club rollout status deployment/sports-club-app --timeout=180s
+          kubectl -n sports-club get pods -o wide
+
+  # ---------------------------------------------------------------------------
+  smoke-test:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-kubectl@v4
+        with: { version: v1.35.6 }
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p "$HOME/.kube"
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+      - name: Run smoke tests
+        run: bash ci/smoke-test.sh

@@ -1,0 +1,51 @@
+# Shared PHP session store. Without this, sessions live on each pod's local
+# disk and users get logged out whenever they hit a different replica —
+# which makes horizontal scaling (and every rolling deploy) break logins.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: redis }
+  template:
+    metadata:
+      labels: { app: redis }
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          args: ["--maxmemory", "48mb", "--maxmemory-policy", "allkeys-lru", "--save", ""]
+          ports:
+            - containerPort: 6379
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits:   { cpu: 100m, memory: 64Mi }
+          livenessProbe:
+            exec: { command: ["redis-cli", "ping"] }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            exec: { command: ["redis-cli", "ping"] }
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        # emptyDir, not a PVC: sessions are ephemeral by nature and Longhorn
+        # space is tight. Tradeoff — a Redis restart logs everyone out.
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+spec:
+  type: ClusterIP
+  selector: { app: redis }
+  ports:
+    - port: 6379
+      targetPort: 6379

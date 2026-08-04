@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: sports-club-app
+spec:
+  type: ClusterIP           # reached via Ingress only
+  selector: { app: sports-club-app }
+  ports:
+    - port: 80
+      targetPort: 80
