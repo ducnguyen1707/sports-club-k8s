@@ -12,6 +12,13 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# NOTE ON `runs-on: ubuntu-latest` BELOW:
+# That is GitHub's HOSTED CI RUNNER — a throwaway VM at GitHub that builds the
+# image. It has nothing to do with the target cluster, whose nodes run
+# Rocky Linux 9.8 on AWS EC2 (ap-south-1). The built image is Debian-based
+# (php:8.3-apache) and runs on those Rocky nodes via containerd; a container's
+# base OS does not need to match the host OS.
+
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/sports-club
 

@@ -34,6 +34,9 @@ spec:
             - name: MYSQL_PASSWORD
               valueFrom:
                 secretKeyRef: { name: mysql-credentials, key: password }
+            - name: MYSQL_EXPORTER_PASSWORD      # consumed by the initdb.d script
+              valueFrom:
+                secretKeyRef: { name: mysql-credentials, key: exporter-password }
           ports:
             - containerPort: 3306
           volumeMounts:
@@ -56,10 +59,41 @@ spec:
             initialDelaySeconds: 20
             periodSeconds: 10
             timeoutSeconds: 5
+        # ---------------------------------------------------------------
+        # mysqld_exporter as a SIDECAR: connects over 127.0.0.1 (no network
+        # hop, no extra Service selector), and its lifecycle is tied to the
+        # database it monitors, which is what you want.
+        # Scraped by the Docker-Compose Prometheus on the worker host via this
+        # pod's ClusterIP — the same pattern already used for Longhorn.
+        # ---------------------------------------------------------------
+        - name: mysqld-exporter
+          image: prom/mysqld-exporter:v0.17.2
+          args:
+            - --mysqld.address=127.0.0.1:3306
+            - --mysqld.username=exporter
+            - --web.listen-address=:9104
+          env:
+            - name: MYSQLD_EXPORTER_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: mysql-credentials, key: exporter-password }
+          ports:
+            - name: metrics
+              containerPort: 9104
+          resources:
+            requests: { cpu: 10m, memory: 24Mi }
+            limits:   { cpu: 50m, memory: 64Mi }
+          readinessProbe:
+            httpGet: { path: /metrics, port: 9104 }
+            initialDelaySeconds: 20
+            periodSeconds: 30
       volumes:
         - name: init
           configMap:
             name: mysql-init
+            # 0755 so MySQL's entrypoint EXECUTES init-exporter.sh rather than
+            # sourcing it. Sourced scripts leak `set -eu` into the entrypoint
+            # shell, which can abort the whole startup on an unrelated error.
+            defaultMode: 0755
   volumeClaimTemplates:
     - metadata:
         name: data

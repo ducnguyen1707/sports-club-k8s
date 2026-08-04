@@ -2,10 +2,19 @@ apiVersion: v1
 kind: Service
 metadata:
   name: mysql
+  labels:
+    app: mysql
 spec:
   type: ClusterIP          # internal only — never exposed outside the cluster
   selector:
     app: mysql
   ports:
-    - port: 3306
+    - name: mysql
+      port: 3306
       targetPort: 3306
+    # Prometheus (Docker Compose, on the worker HOST) scrapes this ClusterIP.
+    # Reachable from the host netns because kube-proxy's iptables rules live
+    # there — same mechanism that lets it scrape Longhorn's ClusterIP today.
+    - name: metrics
+      port: 9104
+      targetPort: 9104

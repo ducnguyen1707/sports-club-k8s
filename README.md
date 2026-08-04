@@ -1,7 +1,24 @@
 # Sports Club Management System — Kubernetes deployment
 
-Deployment tooling for [shreyansh225/Sports-Club-Management-System](https://github.com/shreyansh225/Sports-Club-Management-System),
-running on a 2-node RKE2 cluster.
+Deployment tooling for [shreyansh225/Sports-Club-Management-System](https://github.com/shreyansh225/Sports-Club-Management-System).
+
+## Target environment
+
+| | |
+|---|---|
+| Platform | **AWS EC2**, ap-south-1 (Mumbai) |
+| Nodes | 2 x t3.medium (2 vCPU / 4 GB) |
+| **Node OS** | **Rocky Linux 9.8** |
+| Kubernetes | RKE2 v1.35.6+rke2r1 (pinned) |
+| Runtime | containerd |
+| Storage | Longhorn v1.12.0 |
+| Ingress | rke2-ingress-nginx (DaemonSet, already running) |
+| Monitoring | Prometheus/Grafana/Alertmanager via **Docker Compose on the worker host** (not in-cluster) |
+
+> `runs-on: ubuntu-latest` in the workflow is **GitHub's hosted CI runner**,
+> unrelated to the cluster. The image we build is Debian-based
+> (`php:8.3-apache`) and runs on the Rocky nodes via containerd — a container's
+> base OS need not match the host's.
 
 Upstream is a XAMPP-era PHP/MySQL app with no container support. Everything
 here adapts it for Kubernetes **without modifying the vendored source** in
@@ -24,6 +41,9 @@ k8s/
   secret-template.yaml  never commit a filled-in copy
   base/                 kustomize base
   overlays/production/  hostname + image tag
+monitoring/
+  README.md             how to wire MySQL metrics into the existing stack
+  mysql-alerts.yml      Prometheus alert rules for MySQL
 ci/
   smoke-test.sh
   gen-deploy-kubeconfig.sh
@@ -72,6 +92,8 @@ gh secret set KUBE_CONFIG                 # paste it
 # 5. make the GHCR package public (avoids needing an imagePullSecret)
 #    GitHub → Packages → sports-club → Package settings → Change visibility
 ```
+
+# 6. wire MySQL metrics into the existing Prometheus — see monitoring/README.md
 
 Then set your hostname in `k8s/overlays/production/kustomization.yaml`.
 For testing without DNS, `nip.io` works: `sportsclub.<worker-ip>.nip.io`.
@@ -135,6 +157,22 @@ space free, and every volume needs a replica on both nodes.
 
 ---
 
+## Database monitoring
+
+MySQL runs with a **`mysqld_exporter` sidecar** (port 9104), using a dedicated
+least-privilege `exporter` user created at first boot — `PROCESS`,
+`REPLICATION CLIENT`, and `SELECT` on `performance_schema` only. Not root, not
+the app user.
+
+Because Prometheus lives in Docker Compose on the worker *host* rather than in
+the cluster, it scrapes the exporter via the `mysql` Service's **ClusterIP** —
+the same mechanism already used for Longhorn. Setup steps and the ClusterIP
+caveat are in [`monitoring/README.md`](monitoring/README.md).
+
+Grafana dashboard **7362** (Percona MySQL Overview) works as-is.
+
+---
+
 ## Known limitations
 
 1. **Passwords are not hashed** — upstream stores them plaintext.
@@ -144,3 +182,6 @@ space free, and every volume needs a replica on both nodes.
 4. **`maxReplicas: 4` exceeds real capacity** — see table above.
 5. **No TLS yet** — Ingress is HTTP. cert-manager + Let's Encrypt is the
    natural follow-up once a real hostname exists.
+6. **Prometheus scrapes MySQL by ClusterIP**, which changes if the Service is
+   deleted and recreated. Same caveat as the existing Longhorn target — see
+   `monitoring/README.md`.

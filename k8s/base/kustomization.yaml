@@ -17,6 +17,7 @@ configMapGenerator:
   - name: mysql-init
     files:
       - init.sql=mysql-init.sql
+      - init-exporter.sh=mysql-init-exporter.sh
 
 # ConfigMap name gets a content hash suffix; changing the SQL therefore
 # triggers a rollout instead of silently leaving the old data in place.
