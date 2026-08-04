@@ -26,6 +26,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Lint vendored app + overrides
+        # Jobs using `container:` default to `shell: sh`, which has no process
+        # substitution. Upstream ships filenames with spaces (e.g. "new 1.php"),
+        # so we need -print0 / read -d '' — hence bash explicitly.
+        shell: bash
         run: |
           set -eu
           fail=0
