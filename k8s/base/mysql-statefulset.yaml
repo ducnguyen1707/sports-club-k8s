@@ -13,6 +13,11 @@ spec:
       labels:
         app: mysql
     spec:
+      # Pinned to the worker. The master sits at ~88% CPU requested with the
+      # control plane alone, and the worker has the larger Longhorn pool
+      # (12.11Gi vs 9.08Gi). A database has no business on the control plane.
+      nodeSelector:
+        node-role.kubernetes.io/worker: "true"
       containers:
         - name: mysql
           image: mysql:8.0

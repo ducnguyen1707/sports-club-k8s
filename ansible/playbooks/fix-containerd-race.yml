@@ -1,0 +1,148 @@
+---
+# ---------------------------------------------------------------------------
+# Repair and permanently prevent the containerd-socket boot race that takes
+# the worker NotReady.
+#
+#   ansible-playbook playbooks/fix-containerd-race.yml --limit worker
+#
+# THE RACE
+# /opt/monitoring/docker-compose.yml runs cAdvisor with:
+#     volumes: [ /run/k3s/containerd/containerd.sock:/run/containerd/...:ro ]
+#     restart: unless-stopped
+#
+# /run is tmpfs, so that path is gone after every reboot. Docker and RKE2 both
+# start at boot with no ordering between them. If Docker wins, it does what
+# Docker always does for a missing bind-mount source: it CREATES A DIRECTORY.
+# containerd then cannot create its socket there and exits:
+#
+#     failed to create unix socket on /run/k3s/containerd/containerd.sock:
+#     is a directory
+#
+# rke2-agent restarts forever, the node never goes Ready, and anything pinned
+# to the worker sits Pending. Observed restart counter: 75.
+#
+# THE FIX
+# Repair: drop cAdvisor's mount, remove the directory, restart the agent.
+# Durable: a systemd drop-in that orders docker after rke2-agent AND waits for
+# the socket to actually exist — `After=` alone is not enough, because systemd
+# considers rke2-agent "started" when the process launches, several seconds
+# before containerd's socket appears.
+# ---------------------------------------------------------------------------
+- name: Repair and prevent the containerd socket boot race
+  hosts: worker
+  become: true
+  gather_facts: false
+
+  vars:
+    sock: /run/k3s/containerd/containerd.sock
+    compose: /opt/monitoring/docker-compose.yml
+
+  tasks:
+    # ---------------- detect ----------------
+    - name: Inspect the containerd socket path
+      ansible.builtin.stat:
+        path: "{{ sock }}"
+      register: sock_stat
+
+    - name: Report current state
+      ansible.builtin.debug:
+        msg: >-
+          {{ sock }} is
+          {{ 'a DIRECTORY - race has fired, repairing' if sock_stat.stat.isdir | default(false)
+             else ('a socket - healthy' if sock_stat.stat.exists else 'MISSING') }}
+
+    # ---------------- repair (only when broken) ----------------
+    - name: Repair the wedged socket path
+      when: sock_stat.stat.isdir | default(false)
+      block:
+        # cAdvisor first: while it holds the bind mount the directory cannot
+        # be removed.
+        - name: Stop cAdvisor (it is holding the bind mount)
+          ansible.builtin.command: docker compose -f {{ compose }} stop cadvisor
+          changed_when: true
+
+        - name: Stop rke2-agent
+          ansible.builtin.systemd:
+            name: rke2-agent
+            state: stopped
+
+        - name: Remove the directory squatting on the socket path
+          ansible.builtin.file:
+            path: "{{ sock }}"
+            state: absent
+
+        - name: Start rke2-agent
+          ansible.builtin.systemd:
+            name: rke2-agent
+            state: started
+
+        - name: Wait for containerd to create a real socket
+          ansible.builtin.shell: 'test -S {{ sock }}'
+          register: sock_wait
+          until: sock_wait.rc == 0
+          retries: 30
+          delay: 5
+          changed_when: false
+
+        - name: Start cAdvisor again (the socket now exists, so it binds correctly)
+          ansible.builtin.command: docker compose -f {{ compose }} start cadvisor
+          changed_when: true
+
+    # ---------------- durable prevention (always) ----------------
+    - name: Ensure the docker.service drop-in directory exists
+      ansible.builtin.file:
+        path: /etc/systemd/system/docker.service.d
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Order docker after rke2-agent and wait for the real socket
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/docker.service.d/10-wait-for-rke2-containerd.conf
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          # Prevents the containerd socket boot race.
+          #
+          # cAdvisor (via docker compose, restart: unless-stopped) bind-mounts
+          # /run/k3s/containerd/containerd.sock. /run is tmpfs, so that path is
+          # absent at boot. If Docker starts first it creates a DIRECTORY there,
+          # which permanently blocks containerd and leaves the node NotReady.
+          #
+          # After= alone is insufficient: systemd treats rke2-agent as started
+          # when the process launches, seconds before the socket appears. So we
+          # also poll for it. The loop always exits 0 so a genuinely absent
+          # socket degrades to "no cAdvisor container metrics" rather than
+          # "Docker refuses to start".
+          [Unit]
+          After=rke2-agent.service
+
+          [Service]
+          ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do [ -S /run/k3s/containerd/containerd.sock ] && exit 0; sleep 2; done; exit 0'
+      register: dropin
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: dropin is changed
+
+    # ---------------- verify ----------------
+    - name: Confirm the socket is a socket
+      ansible.builtin.command: stat -c '%F' {{ sock }}
+      register: final_type
+      changed_when: false
+
+    - name: Confirm rke2-agent is active
+      ansible.builtin.command: systemctl is-active rke2-agent
+      register: agent_state
+      changed_when: false
+      failed_when: false
+
+    - name: Result
+      ansible.builtin.debug:
+        msg:
+          - "socket path : {{ final_type.stdout }}   (want: socket)"
+          - "rke2-agent  : {{ agent_state.stdout }}   (want: active)"
+          - "drop-in     : installed, docker now waits for containerd at boot"
