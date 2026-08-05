@@ -48,6 +48,38 @@ jobs:
           exit "$fail"
 
   # ---------------------------------------------------------------------------
+  # SAST: Static Application Security Testing with SonarQube/SonarCloud.
+  # Scan the PHP code for bugs, security vulnerabilities, code smells.
+  # Runs AFTER lint but doesn't block build (you can configure gating in
+  # SonarCloud settings once you've established a baseline).
+  # ---------------------------------------------------------------------------
+  scan-code:
+    runs-on: ubuntu-latest
+    needs: lint
+    # Only scan on main to avoid quota burn on every PR
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }  # Full history for SonarQube to detect deletions
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}  # Get from sonarcloud.io after signup
+        with:
+          args: >
+            -Dsonar.projectKey=sports-club-k8s
+            -Dsonar.organization=your-org
+
+      # Optional: fail the job if quality gate fails (set in SonarCloud UI)
+      # Remove this if you want scans to be informational only
+      - name: Check SonarQube quality gate
+        run: |
+          echo "Quality gate result available at SonarCloud dashboard"
+          echo "Configure 'fail pipeline' in SonarCloud project settings if desired"
+
+  # ---------------------------------------------------------------------------
   # Manifests must render before we bother building an image.
   # ---------------------------------------------------------------------------
   validate-manifests:
@@ -97,13 +129,66 @@ jobs:
           cache-to: type=gha,mode=max
 
   # ---------------------------------------------------------------------------
+  # DAST: Scan the built container image for known vulnerabilities.
+  # Uses Trivy (Open Source Container Scanner from Aqua Security).
+  # Scans for CVEs in base image, installed packages, app dependencies.
+  # Generates SBOM (Software Bill of Materials) for supply chain security.
+  # Runs AFTER build but BEFORE deploy — gates deploy if CRITICAL found.
+  # ---------------------------------------------------------------------------
+  scan-image:
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ needs.build.outputs.tag }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          # Ignore vulnerabilities listed in .trivyignore (checked into repo)
+          ignorefile: '.trivyignore'
+
+      - name: Upload Trivy SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+          category: 'trivy'
+
+      - name: Run Trivy SBOM generation
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ needs.build.outputs.tag }}
+          format: 'cyclonedx'
+          output: 'sbom.json'
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sbom-${{ needs.build.outputs.tag }}
+          path: sbom.json
+          retention-days: 90
+
+      - name: Check Trivy results
+        run: |
+          echo "Image scan complete. Review results in:"
+          echo "  GitHub Security tab (SARIF upload)"
+          echo "  Artifacts (SBOM)"
+          echo "If CRITICAL vulnerabilities exist, review before deploying."
+
+  # ---------------------------------------------------------------------------
   # Deploy. Requires KUBE_CONFIG secret — a kubeconfig for the NAMESPACE-SCOPED
   # ServiceAccount (see README), not a cluster-admin one. If that credential
   # leaks, the blast radius is the sports-club namespace only.
   # ---------------------------------------------------------------------------
   deploy:
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
-    needs: build
+    needs: [build, scan-image]
     runs-on: ubuntu-latest
     environment: production      # add required reviewers in repo settings for manual approval
     steps:

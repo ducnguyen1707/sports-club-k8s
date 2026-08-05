@@ -1,0 +1,158 @@
+---
+# Cluster-level security hardening
+# Run: ansible-playbook -i ../inventories/production.ini security-hardening.yml
+
+- name: Security hardening on all cluster nodes
+  hosts: cluster
+  become: yes
+  gather_facts: yes
+  vars:
+    # Tuning parameters — adjust for your environment
+    fw_http_port: 80
+    fw_https_port: 443
+    fw_k8s_api_port: 6443
+
+  tasks:
+    - name: Update system packages (security patches)
+      dnf:
+        name: '*'
+        state: latest
+        update_cache: yes
+      register: dnf_update
+      changed_when: dnf_update.changed
+
+    - name: Enable firewalld
+      systemd:
+        name: firewalld
+        state: started
+        enabled: yes
+      tags: firewall
+
+    - name: Configure firewall rules (inbound)
+      firewalld:
+        port: "{{ item }}/tcp"
+        permanent: yes
+        state: enabled
+        immediate: yes
+      loop:
+        - "{{ fw_k8s_api_port }}"       # kube-apiserver (master only will be applied)
+        - "{{ fw_http_port }}"
+        - "{{ fw_https_port }}"
+      tags: firewall
+
+    - name: Configure SSH hardening
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        state: present
+      loop:
+        - { regexp: '^#?PermitRootLogin', line: 'PermitRootLogin no' }
+        - { regexp: '^#?PasswordAuthentication', line: 'PasswordAuthentication no' }
+        - { regexp: '^#?X11Forwarding', line: 'X11Forwarding no' }
+      notify: restart sshd
+      tags: ssh
+
+    - name: Enable SELinux in enforcing mode
+      selinux:
+        policy: targeted
+        state: enforcing
+      tags: selinux
+
+    - name: Configure fail2ban for SSH
+      block:
+        - name: Install fail2ban
+          dnf:
+            name: fail2ban
+            state: present
+
+        - name: Enable fail2ban
+          systemd:
+            name: fail2ban
+            state: started
+            enabled: yes
+
+        - name: Configure fail2ban jail.local
+          copy:
+            dest: /etc/fail2ban/jail.local
+            content: |
+              [DEFAULT]
+              bantime = 3600
+              findtime = 600
+              maxretry = 5
+
+              [sshd]
+              enabled = true
+              port = ssh
+              logpath = /var/log/auth.log
+            owner: root
+            group: root
+            mode: '0644'
+          notify: restart fail2ban
+      tags: fail2ban
+
+    - name: Disable unused services
+      systemd:
+        name: "{{ item }}"
+        enabled: no
+        state: stopped
+      loop:
+        - avahi-daemon
+      ignore_errors: yes
+      tags: services
+
+    - name: Set kernel security parameters
+      sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        sysctl_set: yes
+        state: present
+      loop:
+        - { name: 'net.ipv4.ip_forward', value: '1' }  # Required for Kubernetes
+        - { name: 'net.bridge.bridge-nf-call-iptables', value: '1' }
+        - { name: 'net.ipv4.conf.all.rp_filter', value: '1' }
+        - { name: 'kernel.unprivileged_userns_clone', value: '0' }  # Restrict namespaces
+      tags: sysctl
+
+    - name: Configure audit logging
+      block:
+        - name: Install auditd
+          dnf:
+            name: audit
+            state: present
+
+        - name: Enable auditd
+          systemd:
+            name: auditd
+            state: started
+            enabled: yes
+
+        - name: Add audit rules for Kubernetes
+          copy:
+            dest: /etc/audit/rules.d/kubernetes.rules
+            content: |
+              # Audit Kubernetes-critical directories
+              -w /etc/rancher/rke2/ -p wa -k rke2-config
+              -w /var/lib/rancher/rke2/ -p wa -k rke2-data
+              -w /var/lib/kubelet/kubeconfig -p wa -k kubelet-config
+            owner: root
+            group: root
+            mode: '0640'
+          notify: restart auditd
+      tags: audit
+
+  handlers:
+    - name: restart sshd
+      systemd:
+        name: sshd
+        state: restarted
+
+    - name: restart fail2ban
+      systemd:
+        name: fail2ban
+        state: restarted
+
+    - name: restart auditd
+      systemd:
+        name: auditd
+        state: restarted
