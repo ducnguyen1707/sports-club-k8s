@@ -1,0 +1,3 @@
+# Ignore low-severity findings in build dependencies that are removed in final layer
+# Format: CVE-YYYY-XXXX
+# Example: CVE-2023-12345

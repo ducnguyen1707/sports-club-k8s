@@ -1,0 +1,243 @@
+---
+# ---------------------------------------------------------------------------
+# Security posture: VERIFY by default, change only when explicitly asked.
+#
+#   ansible-playbook -i inventories/production.ini playbooks/security-hardening.yml
+#       -> read-only audit. Reports drift. Changes nothing.
+#
+#   ... --tags harden     -> apply SSH / fail2ban / firewall configuration
+#   ... --tags patch      -> apply SECURITY errata only, one node at a time
+#
+# Why verify-first: CLUSTER_GUIDE.md §5 records that SELinux enforcing, SSH
+# key-only login and fail2ban are ALREADY applied to both nodes. This playbook
+# is therefore a drift-detector, not a first-time hardening run. Treating it as
+# the latter is how you accidentally restart sshd on a live control plane.
+#
+# Target OS is Rocky Linux 9 (RHEL family) — NOT Debian/Ubuntu. Several paths
+# below differ from the Debian equivalents you'll find in most examples.
+# ---------------------------------------------------------------------------
+- name: Verify (and optionally apply) security hardening
+  hosts: cluster
+  become: true
+  gather_facts: true
+  serial: 1              # one node at a time — never disrupt both cluster nodes together
+
+  vars:
+    fw_http_port: 80
+    fw_https_port: 443
+    fw_k8s_api_port: 6443
+
+  tasks:
+    # =====================================================================
+    # VERIFY — always runs, never mutates
+    # =====================================================================
+    - name: Check SELinux mode
+      ansible.builtin.command: getenforce
+      register: selinux_mode
+      changed_when: false
+      failed_when: false
+
+    - name: Check sshd effective configuration
+      ansible.builtin.shell: |
+        sshd -T 2>/dev/null | grep -iE '^(permitrootlogin|passwordauthentication|x11forwarding|maxauthtries)' | sort
+      register: sshd_effective
+      changed_when: false
+      failed_when: false
+
+    - name: Check fail2ban service state
+      ansible.builtin.command: systemctl is-active fail2ban
+      register: fail2ban_state
+      changed_when: false
+      failed_when: false
+
+    - name: Check firewalld service state
+      ansible.builtin.command: systemctl is-active firewalld
+      register: firewalld_state
+      changed_when: false
+      failed_when: false
+
+    - name: Check for pending security errata
+      ansible.builtin.shell: dnf updateinfo list --security 2>/dev/null | grep -c 'Sec' || true
+      register: pending_security
+      changed_when: false
+      failed_when: false
+
+    - name: Security posture report
+      ansible.builtin.debug:
+        msg:
+          - "host                  : {{ inventory_hostname }}"
+          - "SELinux               : {{ selinux_mode.stdout | default('unknown') }}   (want Enforcing)"
+          - "fail2ban              : {{ fail2ban_state.stdout | default('unknown') }}   (want active)"
+          - "firewalld             : {{ firewalld_state.stdout | default('unknown') }}   (want active)"
+          - "pending security errata: {{ pending_security.stdout | default('?') | trim }}"
+          - "sshd effective config :"
+          - "{{ sshd_effective.stdout_lines | default([]) }}"
+
+    - name: Warn when SELinux is not enforcing
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: SELinux is '{{ selinux_mode.stdout }}', expected 'Enforcing'.
+          NOT changing it automatically — flipping SELinux on a node already
+          running containerd/kubelet can trigger AVC denials against unlabelled
+          files and needs a relabel plus reboot. Fix deliberately, not in passing.
+      when: selinux_mode.stdout | default('') != 'Enforcing'
+
+    # =====================================================================
+    # HARDEN — only with: --tags harden
+    # =====================================================================
+    - name: Apply hardening configuration
+      tags: [harden, never]
+      block:
+        - name: Ensure firewalld is running
+          ansible.builtin.systemd:
+            name: firewalld
+            state: started
+            enabled: true
+
+        - name: Open HTTP/HTTPS on all nodes
+          ansible.posix.firewalld:
+            port: "{{ item }}/tcp"
+            permanent: true
+            state: enabled
+            immediate: true
+          loop:
+            - "{{ fw_http_port }}"
+            - "{{ fw_https_port }}"
+
+        # Only the master runs kube-apiserver. Opening 6443 on the worker
+        # would expose a port with nothing behind it.
+        - name: Open the Kubernetes API port on the master only
+          ansible.posix.firewalld:
+            port: "{{ fw_k8s_api_port }}/tcp"
+            permanent: true
+            state: enabled
+            immediate: true
+          when: inventory_hostname in groups['master']
+
+        - name: Harden sshd
+          ansible.builtin.lineinfile:
+            path: /etc/ssh/sshd_config
+            regexp: "{{ item.regexp }}"
+            line: "{{ item.line }}"
+            validate: /usr/sbin/sshd -t -f %s     # never install a config that breaks sshd
+          loop:
+            - { regexp: '^#?PermitRootLogin',        line: 'PermitRootLogin no' }
+            - { regexp: '^#?PasswordAuthentication', line: 'PasswordAuthentication no' }
+            - { regexp: '^#?X11Forwarding',          line: 'X11Forwarding no' }
+          notify: reload sshd
+
+        - name: Install fail2ban
+          ansible.builtin.dnf:
+            name: fail2ban
+            state: present
+
+        # Rocky/RHEL logs SSH auth to /var/log/secure, NOT /var/log/auth.log
+        # (that path is Debian-only). Using the systemd backend sidesteps the
+        # question entirely, since Rocky 9 journals sshd.
+        - name: Configure the fail2ban sshd jail (systemd backend)
+          ansible.builtin.copy:
+            dest: /etc/fail2ban/jail.local
+            owner: root
+            group: root
+            mode: '0644'
+            content: |
+              [DEFAULT]
+              bantime  = 3600
+              findtime = 600
+              maxretry = 4
+
+              [sshd]
+              enabled = true
+              port    = ssh
+              backend = systemd
+          notify: restart fail2ban
+
+        - name: Enable fail2ban
+          ansible.builtin.systemd:
+            name: fail2ban
+            state: started
+            enabled: true
+
+        # Only sysctls that actually exist on a RHEL 9 kernel.
+        # (kernel.unprivileged_userns_clone is a Debian patch and is NOT set
+        # here — attempting it aborts the play on Rocky.)
+        - name: Set kernel network parameters
+          ansible.posix.sysctl:
+            name: "{{ item.name }}"
+            value: "{{ item.value }}"
+            sysctl_set: true
+            state: present
+            reload: true
+          loop:
+            - { name: 'net.ipv4.ip_forward',            value: '1' }   # required by Kubernetes
+            - { name: 'net.ipv4.conf.all.rp_filter',    value: '1' }
+
+        - name: Ensure auditd is present and running
+          ansible.builtin.dnf:
+            name: audit
+            state: present
+
+        - name: Add audit rules for Kubernetes-critical paths
+          ansible.builtin.copy:
+            dest: /etc/audit/rules.d/kubernetes.rules
+            owner: root
+            group: root
+            mode: '0640'
+            content: |
+              -w /etc/rancher/rke2/ -p wa -k rke2-config
+              -w /var/lib/rancher/rke2/ -p wa -k rke2-data
+              -w /var/lib/kubelet/kubeconfig -p wa -k kubelet-config
+          notify: restart auditd
+
+        - name: Enable auditd
+          ansible.builtin.systemd:
+            name: auditd
+            state: started
+            enabled: true
+
+    # =====================================================================
+    # PATCH — only with: --tags patch
+    # =====================================================================
+    # Deliberately NOT `name: '*' state: latest`. An unbounded upgrade on a
+    # live Kubernetes node can pull a new kernel, glibc or containerd and take
+    # the control plane down. Security errata only, one node at a time
+    # (serial: 1 above), and never automatically rebooting.
+    - name: Apply security errata only
+      tags: [patch, never]
+      ansible.builtin.dnf:
+        name: '*'
+        state: latest
+        security: true
+        exclude: 'rke2-*,kernel*,containerd*'
+      register: patch_result
+
+    - name: Note whether a reboot is required
+      tags: [patch, never]
+      ansible.builtin.command: needs-restarting -r
+      register: needs_reboot
+      changed_when: false
+      failed_when: false
+
+    - name: Reboot advisory
+      tags: [patch, never]
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'REBOOT REQUIRED on ' ~ inventory_hostname ~ ' — drain it first, then reboot manually.'
+             if needs_reboot.rc != 0 else 'No reboot required on ' ~ inventory_hostname }}
+
+  handlers:
+    # reload, not restart — keeps existing SSH sessions (including this one) alive
+    - name: reload sshd
+      ansible.builtin.systemd:
+        name: sshd
+        state: reloaded
+
+    - name: restart fail2ban
+      ansible.builtin.systemd:
+        name: fail2ban
+        state: restarted
+
+    - name: restart auditd
+      # auditd refuses `systemctl restart`; it must be signalled via service(8)
+      ansible.builtin.command: service auditd restart
+      changed_when: true

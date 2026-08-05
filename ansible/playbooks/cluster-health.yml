@@ -1,0 +1,169 @@
+---
+# Cluster health check and diagnostics
+# Run: ansible-playbook -i ../inventories/production.ini cluster-health.yml
+
+- name: Collect cluster health metrics
+  hosts: cluster
+  gather_facts: yes
+  tasks:
+    - name: Collect node-level metrics
+      block:
+        - name: Get CPU usage
+          shell: top -bn1 | grep "Cpu(s)" | awk '{print $2}' | cut -d'%' -f1
+          register: cpu_usage
+          changed_when: false
+
+        - name: Get memory usage
+          shell: free | grep Mem | awk '{printf("%.2f", $3/$2 * 100.0)}'
+          register: mem_usage
+          changed_when: false
+
+        - name: Get disk usage on root
+          shell: df / | tail -1 | awk '{print $5}' | cut -d'%' -f1
+          register: disk_usage
+          changed_when: false
+
+        # RKE2 does NOT run a standalone containerd.service — containerd is a
+        # child process of rke2-server/rke2-agent. Checking the unit would
+        # always report "not-running" and produce a false alarm; check the
+        # socket the runtime actually exposes instead.
+        - name: Get container runtime status
+          shell: test -S /run/k3s/containerd/containerd.sock && echo active || echo missing
+          register: containerd_status
+          changed_when: false
+
+        # The master runs rke2-server, the worker runs rke2-agent. `systemctl
+        # is-active` PRINTS "inactive" as well as returning non-zero, so a
+        # naive `a || b` chain emits both words. Use --quiet and report only
+        # the unit that is actually up.
+        - name: Get RKE2 status
+          shell: |
+            for unit in rke2-server rke2-agent; do
+              if systemctl is-active --quiet "$unit"; then echo "$unit active"; exit 0; fi
+            done
+            echo "not-running"
+          register: rke2_status
+          changed_when: false
+
+        - name: Display node metrics
+          debug:
+            msg: |
+              Node: {{ inventory_hostname }}
+              CPU Usage: {{ cpu_usage.stdout }}%
+              Memory Usage: {{ mem_usage.stdout }}%
+              Disk Usage: {{ disk_usage.stdout }}%
+              Containerd: {{ containerd_status.stdout }}
+              RKE2: {{ rke2_status.stdout }}
+
+    - name: Check systemd service health (master only)
+      block:
+        - name: Get RKE2 systemd status
+          systemd:
+            name: rke2-server
+          register: rke2_server_status
+          changed_when: false
+
+        - name: Check for service restarts (sign of crashes)
+          shell: systemctl status rke2-server | grep -i "restart\|restart counter" || echo "none"
+          register: restart_info
+          changed_when: false
+
+        - name: Display master-specific info
+          debug:
+            msg: |
+              Master Service Status: {{ rke2_server_status.status.ActiveState }}
+              Restart Info: {{ restart_info.stdout }}
+      when: inventory_hostname in groups['master']
+
+    - name: Check systemd service health (worker only)
+      block:
+        - name: Get RKE2 agent status
+          systemd:
+            name: rke2-agent
+          register: rke2_agent_status
+          changed_when: false
+
+        # Needs become: the `rocky` user is deliberately NOT in the docker
+        # group, so without this the command fails and misreports the
+        # monitoring stack as "not-configured".
+        - name: Check Docker Compose services
+          become: true
+          shell: |
+            if [ -f /opt/monitoring/docker-compose.yml ]; then
+              docker compose -f /opt/monitoring/docker-compose.yml ps --format '{{ "{{" }}.Name{{ "}}" }} {{ "{{" }}.State{{ "}}" }}' 2>/dev/null \
+                || echo "compose present but not queryable"
+            else
+              echo "not-configured"
+            fi
+          register: docker_status
+          changed_when: false
+
+        - name: Display worker-specific info
+          debug:
+            msg: |
+              Worker Service Status: {{ rke2_agent_status.status.ActiveState }}
+              Docker Compose ({{ docker_status.stdout_lines | length }} containers):
+                {{ docker_status.stdout_lines | join('
+                ') }}
+      when: inventory_hostname in groups['worker']
+
+# Run Kubernetes-level checks from master.
+# NOTE: no `---` here. A playbook file must be a SINGLE YAML document holding a
+# list of plays; a second document separator makes the whole file unparseable,
+# so neither play would run.
+- name: Kubernetes cluster diagnostics
+  hosts: master
+  gather_facts: no
+  environment:
+    PATH: "{{ ansible_env.PATH }}:/var/lib/rancher/rke2/bin"
+    KUBECONFIG: /etc/rancher/rke2/rke2.yaml
+  tasks:
+    - name: Check node readiness
+      shell: |
+        kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}'
+      register: node_status
+      changed_when: false
+
+    - name: Check pod health
+      shell: |
+        kubectl get pods -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.status.phase}{"\n"}{end}' | \
+        grep -v Running | wc -l
+      register: unhealthy_pods
+      changed_when: false
+
+    - name: Check persistent volumes
+      shell: |
+        kubectl get pv -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.phase}{"\n"}{end}'
+      register: pv_status
+      changed_when: false
+
+    - name: Check for node pressure conditions
+      shell: |
+        kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.conditions[?(@.type=="MemoryPressure")].status}{"\n"}{end}'
+      register: memory_pressure
+      changed_when: false
+
+    - name: Display Kubernetes health
+      debug:
+        msg: |
+          === NODE STATUS ===
+          {{ node_status.stdout }}
+
+          === UNHEALTHY PODS ===
+          Count: {{ unhealthy_pods.stdout }}
+
+          === PERSISTENT VOLUMES ===
+          {{ pv_status.stdout }}
+
+          === MEMORY PRESSURE ===
+          {{ memory_pressure.stdout }}
+
+    - name: Check for recent node events
+      shell: |
+        kubectl get events -A --sort-by='.lastTimestamp' | tail -20
+      register: recent_events
+      changed_when: false
+
+    - name: Display recent events
+      debug:
+        msg: "Recent cluster events:\n{{ recent_events.stdout }}"

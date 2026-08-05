@@ -1,0 +1,38 @@
+# Append these into the `groups:` list of /opt/monitoring/alerts.yml
+# on the worker, alongside the existing NodeDown/HighMemory/DiskAlmostFull/
+# LonghornVolumeDegraded rules.
+  - name: mysql
+    rules:
+      - alert: MysqlDown
+        expr: mysql_up == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: 'MySQL is down ({{ $labels.instance }})'
+          description: 'mysqld_exporter cannot reach MySQL. The Sports Club app will return 503.'
+
+      - alert: MysqlTooManyConnections
+        expr: >
+          mysql_global_status_threads_connected
+            / on(instance) mysql_global_variables_max_connections > 0.8
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: 'MySQL connections >80% of max ({{ $labels.instance }})'
+          description: 'PHP opens a connection per request and never pools — watch this when the app scales up.'
+
+      - alert: MysqlSlowQueriesRising
+        expr: rate(mysql_global_status_slow_queries[5m]) > 0.2
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: 'MySQL slow queries increasing ({{ $labels.instance }})'
+          description: 'Upstream queries are unindexed in places; investigate before scaling further.'
+
+      - alert: MysqlRestarted
+        expr: mysql_global_status_uptime < 120
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: 'MySQL restarted recently ({{ $labels.instance }})'
+          description: 'Uptime under 2 minutes. Check for OOMKill — the pod limit is 640Mi.'

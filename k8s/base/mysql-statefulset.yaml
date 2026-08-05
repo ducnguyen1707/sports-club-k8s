@@ -21,7 +21,15 @@ spec:
             # performance schema would waste ~300MB on a 4GB node.
             - --innodb-buffer-pool-size=64M
             - --performance-schema=OFF
-            - --skip-host-cache
+            # Binary logging is ON by default in MySQL 8 and is pure waste
+            # here: there is no replication and no point-in-time-recovery
+            # story, so it only consumes disk and write I/O.
+            - --skip-log-bin
+            # Default redo capacity is 100MB; irrelevant at this write rate.
+            - --innodb-redo-log-capacity=32M
+            # --skip-host-cache is deprecated since 8.0.29; this is the
+            # supported spelling.
+            - --host-cache-size=0
           env:
             - name: MYSQL_DATABASE
               value: sports_club_db        # matches db_conn.php default
@@ -34,6 +42,9 @@ spec:
             - name: MYSQL_PASSWORD
               valueFrom:
                 secretKeyRef: { name: mysql-credentials, key: password }
+            - name: MYSQL_EXPORTER_PASSWORD      # consumed by the initdb.d script
+              valueFrom:
+                secretKeyRef: { name: mysql-credentials, key: exporter-password }
           ports:
             - containerPort: 3306
           volumeMounts:
@@ -45,6 +56,16 @@ spec:
           resources:
             requests: { cpu: 100m, memory: 256Mi }
             limits:   { cpu: 500m, memory: 640Mi }
+          # First boot must initialise the data directory AND import the
+          # schema, on Longhorn-backed storage. If that overruns the liveness
+          # delay, kubelet kills MySQL *during* the import and leaves a
+          # half-initialised database that then fails confusingly on restart.
+          # startupProbe gives it 300s of grace; liveness only begins after.
+          startupProbe:
+            exec: { command: ["mysqladmin", "ping", "-h", "127.0.0.1"] }
+            periodSeconds: 10
+            failureThreshold: 30
+            timeoutSeconds: 5
           livenessProbe:
             exec: { command: ["mysqladmin", "ping", "-h", "127.0.0.1"] }
             initialDelaySeconds: 45
@@ -56,10 +77,41 @@ spec:
             initialDelaySeconds: 20
             periodSeconds: 10
             timeoutSeconds: 5
+        # ---------------------------------------------------------------
+        # mysqld_exporter as a SIDECAR: connects over 127.0.0.1 (no network
+        # hop, no extra Service selector), and its lifecycle is tied to the
+        # database it monitors, which is what you want.
+        # Scraped by the Docker-Compose Prometheus on the worker host via this
+        # pod's ClusterIP — the same pattern already used for Longhorn.
+        # ---------------------------------------------------------------
+        - name: mysqld-exporter
+          image: prom/mysqld-exporter:v0.17.2
+          args:
+            - --mysqld.address=127.0.0.1:3306
+            - --mysqld.username=exporter
+            - --web.listen-address=:9104
+          env:
+            - name: MYSQLD_EXPORTER_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: mysql-credentials, key: exporter-password }
+          ports:
+            - name: metrics
+              containerPort: 9104
+          resources:
+            requests: { cpu: 10m, memory: 24Mi }
+            limits:   { cpu: 50m, memory: 64Mi }
+          readinessProbe:
+            httpGet: { path: /metrics, port: 9104 }
+            initialDelaySeconds: 20
+            periodSeconds: 30
       volumes:
         - name: init
           configMap:
             name: mysql-init
+            # 0755 so MySQL's entrypoint EXECUTES init-exporter.sh rather than
+            # sourcing it. Sourced scripts leak `set -eu` into the entrypoint
+            # shell, which can abort the whole startup on an unrelated error.
+            defaultMode: 0755
   volumeClaimTemplates:
     - metadata:
         name: data

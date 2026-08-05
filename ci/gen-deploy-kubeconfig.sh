@@ -19,7 +19,7 @@ SERVER="${SERVER:?set SERVER=https://<master-ip>:6443}"
 
 command -v kubectl >/dev/null || { echo "kubectl not found"; exit 1; }
 
-echo "==> waiting for the ServiceAccount token to be populated"
+echo "==> waiting for the ServiceAccount token to be populated" >&2
 for _ in $(seq 1 30); do
   TOKEN="$(kubectl -n "$NS" get secret "$SECRET" -o jsonpath='{.data.token}' 2>/dev/null || true)"
   [ -n "${TOKEN:-}" ] && break
@@ -52,21 +52,21 @@ contexts:
 current-context: ${SA}@rke2
 EOF
 
-echo
-echo "==> verifying the credential is properly scoped"
-echo -n "  can deploy in ${NS} (want yes): "
-KUBECONFIG="$OUT" kubectl auth can-i create deployments -n "$NS" || true
-echo -n "  can read secrets (want no):    "
-KUBECONFIG="$OUT" kubectl auth can-i get secrets -n "$NS" || true
-echo -n "  can touch kube-system (want no): "
-KUBECONFIG="$OUT" kubectl auth can-i list pods -n kube-system || true
-echo -n "  can delete namespaces (want no): "
-KUBECONFIG="$OUT" kubectl auth can-i delete namespaces || true
+echo >&2
+echo "==> verifying the credential is properly scoped" >&2
+echo -n "  can deploy in ${NS} (want yes): " >&2
+KUBECONFIG="$OUT" kubectl auth can-i create deployments -n "$NS" >&2 || true
+echo -n "  can read secrets (want no):    " >&2
+KUBECONFIG="$OUT" kubectl auth can-i get secrets -n "$NS" >&2 || true
+echo -n "  can touch kube-system (want no): " >&2
+KUBECONFIG="$OUT" kubectl auth can-i list pods -n kube-system >&2 || true
+echo -n "  can delete namespaces (want no): " >&2
+KUBECONFIG="$OUT" kubectl auth can-i delete namespaces >&2 || true
 
-echo
-echo "============================================================"
-echo "Add this as GitHub repo secret  KUBE_CONFIG"
-echo "  gh secret set KUBE_CONFIG"
-echo "============================================================"
+echo >&2
+echo "============================================================" >&2
+echo "stdout below is PURE base64 — pipe it straight into:" >&2
+echo "  gh secret set KUBE_CONFIG" >&2
+echo "============================================================" >&2
 base64 -w0 < "$OUT"; echo
 rm -f "$OUT"

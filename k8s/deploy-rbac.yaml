@@ -13,8 +13,15 @@ metadata:
   namespace: sports-club
 rules:
   - apiGroups: [""]
-    resources: ["services", "configmaps", "persistentvolumeclaims", "pods", "pods/log", "pods/exec"]
+    resources: ["services", "configmaps", "pods", "pods/log", "pods/exec"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # PersistentVolumeClaims deliberately WITHOUT "delete". `kubectl apply` never
+  # deletes a PVC, and the StatefulSet controller owns MySQL's volume — so the
+  # verb buys the pipeline nothing, while withholding it means a leaked CI
+  # token cannot destroy the database.
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
   - apiGroups: ["apps"]
     resources: ["deployments", "statefulsets", "replicasets"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]

@@ -1,0 +1,150 @@
+---
+# ---------------------------------------------------------------------------
+# Grow a node's EBS root volume AND the filesystem on top of it.
+#
+#   ansible-playbook -i inventories/production.ini playbooks/resize-disk.yml
+#   ansible-playbook -i inventories/production.ini playbooks/resize-disk.yml --limit worker
+#
+# Sizing lives in the INVENTORY (ebs_size_gb per host), so growing a node later
+# is a one-number change plus a re-run. Fully idempotent: re-running when
+# everything is already the right size reports "ok" and changes nothing.
+#
+# Why this is Ansible and not Terraform: a resize is two operations — the AWS
+# API call AND growpart/xfs_growfs inside the OS. Terraform only does the
+# former. It also can't safely own a root volume, because that volume belongs
+# to aws_instance.root_block_device; importing it risks Terraform proposing to
+# REPLACE a running node holding Longhorn replicas.
+#
+# Uses the AWS CLI rather than the amazon.aws collection so there is no boto3 /
+# collection dependency — the CLI is already installed and authenticated.
+# ---------------------------------------------------------------------------
+- name: Resize EBS root volume and grow the filesystem
+  hosts: cluster
+  become: true
+  gather_facts: true
+  serial: 1                 # one node at a time — never touch both cluster nodes at once
+
+  pre_tasks:
+    - name: Require ebs_volume_id and ebs_size_gb to be set for this host
+      ansible.builtin.assert:
+        that:
+          - ebs_volume_id is defined
+          - ebs_size_gb is defined
+        fail_msg: >-
+          {{ inventory_hostname }} is missing ebs_volume_id and/or ebs_size_gb.
+          Set them in inventories/production.ini.
+
+  tasks:
+    - name: Capture filesystem size before
+      ansible.builtin.command: df -h --output=size,used,avail,pcent /
+      register: df_before
+      changed_when: false
+
+    # ---------------------- AWS side (from the control node) ----------------
+    - name: Look up the volume's current size
+      ansible.builtin.command: >-
+        aws ec2 describe-volumes
+        --volume-ids {{ ebs_volume_id }}
+        --region {{ aws_region }}
+        --query 'Volumes[0].Size' --output text
+      delegate_to: localhost
+      become: false
+      register: current_size
+      changed_when: false
+
+    - name: Modify the EBS volume
+      ansible.builtin.command: >-
+        aws ec2 modify-volume
+        --volume-id {{ ebs_volume_id }}
+        --region {{ aws_region }}
+        --size {{ ebs_size_gb }}
+      delegate_to: localhost
+      become: false
+      # Skipped entirely when already at or above target — this is what makes
+      # the play idempotent, and it also avoids tripping AWS's 6h cooldown.
+      when: current_size.stdout | trim | int < ebs_size_gb | int
+      register: modify_result
+
+    - name: Wait for the volume modification to finish
+      ansible.builtin.command: >-
+        aws ec2 describe-volumes-modifications
+        --volume-ids {{ ebs_volume_id }}
+        --region {{ aws_region }}
+        --query 'VolumesModifications[0].ModificationState' --output text
+      delegate_to: localhost
+      become: false
+      register: mod_state
+      # 'optimizing' already means the new size is usable by the OS;
+      # full 'completed' can take hours and we do not need to block on it.
+      until: mod_state.stdout | trim in ['optimizing', 'completed']
+      retries: 30
+      delay: 10
+      changed_when: false
+      when: modify_result is changed
+
+    # ---------------------- OS side (on the node) ---------------------------
+    - name: Ensure growpart is installed
+      ansible.builtin.dnf:
+        name: cloud-utils-growpart
+        state: present
+
+    - name: Find the device backing /
+      ansible.builtin.command: findmnt -no SOURCE /
+      register: root_src
+      changed_when: false
+
+    - name: Find the filesystem type of /
+      ansible.builtin.command: findmnt -no FSTYPE /
+      register: root_fstype
+      changed_when: false
+
+    # t3 is a Nitro instance, so the kernel sees /dev/nvme0n1p1 even though the
+    # AWS console reports the device as /dev/sda1. lsblk PKNAME resolves the
+    # parent disk correctly for nvme, xvd and sd naming alike.
+    - name: Find the parent disk of the root partition
+      ansible.builtin.command: lsblk -no PKNAME {{ root_src.stdout | trim }}
+      register: root_pkname
+      changed_when: false
+
+    - name: Derive disk and partition number
+      ansible.builtin.set_fact:
+        root_disk: "/dev/{{ root_pkname.stdout | trim }}"
+        root_partnum: "{{ root_src.stdout | trim | regex_replace('^.*?([0-9]+)$', '\\1') }}"
+
+    - name: Grow the partition to fill the volume
+      ansible.builtin.command: growpart {{ root_disk }} {{ root_partnum }}
+      register: growpart_result
+      # growpart exits 1 and prints NOCHANGE when the partition already fills
+      # the disk. That is success for our purposes, so only a *different*
+      # non-zero exit is a real failure.
+      failed_when:
+        - growpart_result.rc != 0
+        - "'NOCHANGE' not in growpart_result.stdout"
+      changed_when: growpart_result.rc == 0
+
+    - name: Grow the XFS filesystem
+      ansible.builtin.command: xfs_growfs /
+      when: root_fstype.stdout | trim == 'xfs'
+      register: xfs_result
+      changed_when: "'data blocks changed from' in xfs_result.stdout"
+
+    - name: Grow the ext filesystem
+      ansible.builtin.command: resize2fs {{ root_src.stdout | trim }}
+      when: root_fstype.stdout | trim in ['ext4', 'ext3', 'ext2']
+      register: ext_result
+      changed_when: "'nothing to do' not in ext_result.stdout"
+
+    - name: Capture filesystem size after
+      ansible.builtin.command: df -h --output=size,used,avail,pcent /
+      register: df_after
+      changed_when: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg:
+          - "host          : {{ inventory_hostname }}"
+          - "volume        : {{ ebs_volume_id }}"
+          - "volume size   : {{ current_size.stdout | trim }}GB -> {{ ebs_size_gb }}GB"
+          - "root device   : {{ root_src.stdout | trim }} ({{ root_fstype.stdout | trim }}) on {{ root_disk }}"
+          - "filesystem before : {{ df_before.stdout_lines | last | trim }}"
+          - "filesystem after  : {{ df_after.stdout_lines | last | trim }}"

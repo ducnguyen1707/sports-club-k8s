@@ -12,11 +12,4 @@ images:
 
 # Set your real hostname here. For testing without DNS, nip.io works:
 #   sportsclub.<worker-ip>.nip.io
-patches:
-  - target:
-      kind: Ingress
-      name: sports-club-app
-    patch: |-
-      - op: replace
-        path: /spec/rules/0/host
-        value: sportsclub.local
+# No Ingress patch: the Ingress is deferred (see base/kustomization.yaml).
