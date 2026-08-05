@@ -49,6 +49,34 @@ check "pptx NOT public"                  "$SVC/SPORTS%20CLUB.pptx"  404
 # Apache hardening: directory listing disabled
 check "no directory listing (images/)"   "$SVC/images/"             403
 
+# ---------------------------------------------------------------------------
+# Login redirect. This specifically guards the output_buffering regression:
+# 22 upstream files emit a blank line before their opening <?php tag, so with
+# buffering off the header("location: ...") after a successful login is
+# dropped and the user gets a blank page — while the login itself "succeeds".
+# Only the SUCCESS path calls header(), so bad credentials would not catch it.
+#
+# Uses the default credentials. After you change the admin password (which you
+# should), either set SMOKE_USER/SMOKE_PASS or set SMOKE_LOGIN=0 to skip.
+# ---------------------------------------------------------------------------
+if [ "${SMOKE_LOGIN:-1}" = "1" ]; then
+  echo "==> login redirect"
+  SMOKE_USER="${SMOKE_USER:-admin1}"
+  SMOKE_PASS="${SMOKE_PASS:-admin1}"
+  login_code="$(kubectl -n "$NS" exec "$POD" -- curl -s -o /dev/null -w '%{http_code}' \
+      --max-time 10 -d "user_id_auth=${SMOKE_USER}&pass_key=${SMOKE_PASS}" \
+      "$SVC/secure_login.php" || echo 000)"
+  if [ "$login_code" = "302" ]; then
+    printf '  PASS  %-46s %s\n' "successful login redirects" "$login_code"
+  else
+    printf '  FAIL  %-46s got %s, want 302 (output_buffering off?)\n' \
+      "successful login redirects" "$login_code"
+    FAILED=1
+  fi
+else
+  echo "==> login redirect check skipped (SMOKE_LOGIN=0)"
+fi
+
 echo "==> header checks"
 if kubectl -n "$NS" exec "$POD" -- curl -sI --max-time 10 "$SVC/index.php" | grep -qi '^x-powered-by'; then
   echo "  FAIL  X-Powered-By header exposed"; FAILED=1
