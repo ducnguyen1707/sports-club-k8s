@@ -174,4 +174,6 @@ If a vulnerability is disclosed:
 - **OWASP Top 10** — app-level vulnerabilities (what SonarQube checks against)
 - **PCI DSS** — if handling payment data (out of scope for this app)
 
-See `/home/duc/k8s-docs/` for cluster-specific hardening applied.
+Cluster-specific hardening already applied to both nodes is recorded in the
+operator's cluster guide (not in this repo); `ansible/playbooks/security-hardening.yml`
+verifies it and reports drift.

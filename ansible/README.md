@@ -1,180 +1,118 @@
-# Ansible for Cluster Management
+# Ansible — cluster operations (IaC)
 
-Infrastructure as Code for cluster operations — not for the app (that's Kubernetes), but for the **cluster itself** (security patches, hardening, monitoring, day-2 operations).
+Infrastructure as Code for the **cluster itself** — disk sizing, security posture,
+health diagnostics. The application is deployed by Kubernetes; this is day-2
+operations on the two Rocky Linux 9 EC2 nodes underneath it.
 
-## Why Ansible instead of Terraform?
-
-- **Terraform:** state-based, infrastructure-focused. Great for EC2 instances, security groups, networking.
-- **Ansible:** task-based, configuration-focused. Great for running commands, configuring services, applying patches across nodes.
-
-**This repo uses both:** Terraform/CloudFormation manages EC2 infra (in progress); Ansible manages the cluster's Linux config and Kubernetes operations.
-
-## Quick start
+## Setup
 
 ```bash
-# Install Ansible
-pip install ansible
+pip install --user ansible-core
+ansible-galaxy collection install ansible.posix     # firewalld + sysctl modules
+```
 
-# Verify connectivity
-ansible -i inventories/production.ini all -m ping
+`ansible.cfg` in this directory sets the inventory, disables host-key prompts and
+enables SSH pipelining — so run all commands **from `ansible/`**.
 
-# Run security hardening
-ansible-playbook -i inventories/production.ini playbooks/security-hardening.yml
-
-# Check cluster health
-ansible-playbook -i inventories/production.ini playbooks/cluster-health.yml
+```bash
+ansible cluster -m ping        # verify connectivity to both nodes
 ```
 
 ## Inventory
 
-Two inventories:
+`inventories/production.ini` — this is where **all per-node configuration lives**.
 
-| File | Purpose |
-|---|---|
-| `inventories/production.ini` | Real cluster — master + worker in ap-south-1 |
-| `inventories/local.ini` | Test against localhost (for dry-runs, testing) |
+| Host | Address | Why |
+|---|---|---|
+| `rke2-master` | `13.126.83.203` (Elastic IP) | stable, reachable from anywhere |
+| `rke2-worker` | `172.31.34.225` (**private**) | has no Elastic IP; its public address changes on every restart |
 
-**Hosts in production:**
-- `rke2-master` — 13.126.83.203 (EIP, stable)
-- `rke2-worker` — 172.31.34.225 (private IP, changes on restart)
-
-**Update the worker IP if it changes** (no Elastic IP attached to it). The master's EIP is stable.
+The worker is therefore addressed by its **stable private IP** and reached via a
+`ProxyCommand` through the master. That's why `ansible cluster -m ping` works from
+your laptop even though `172.31.x.x` isn't routable from outside the VPC.
 
 ## Playbooks
 
-### `security-hardening.yml`
+### `resize-disk.yml` — grow a node's root volume
 
-Hardens both master and worker:
-- Updates system packages (security patches)
-- Configures firewalld (80, 443, 6443 inbound)
-- SSH hardening (no root login, no password auth, no X11)
-- SELinux enforcing mode
-- fail2ban for SSH brute-force protection
-- Audit logging for Kubernetes-critical paths
-- Kernel hardening (rp_filter, namespace restrictions)
+Handles **both halves** of a resize: the AWS API call *and* `growpart` +
+`xfs_growfs` inside the OS. (Terraform only does the first; it also can't safely
+own a root volume, since that belongs to `aws_instance.root_block_device` —
+importing it risks Terraform proposing to *replace* a live node.)
 
-**Run before initial deployment or after a security incident:**
-```bash
-ansible-playbook -i inventories/production.ini playbooks/security-hardening.yml
-```
+**Sizing lives in the inventory**, so growing a node later is a one-number change:
 
-**Idempotent:** safe to run multiple times. Only changes state if needed.
-
-### `cluster-health.yml`
-
-Diagnostics and monitoring — two parts:
-
-**Part 1: Node-level metrics (runs on all nodes)**
-- CPU/memory/disk usage
-- Containerd and RKE2 systemd status
-- Service restart counts (sign of crashes)
-
-**Part 2: Kubernetes diagnostics (runs on master only)**
-- Node readiness status
-- Pod health (count of non-Running pods)
-- PersistentVolume status
-- Memory pressure conditions
-- Recent cluster events
-
-**Run on-demand for troubleshooting:**
-```bash
-ansible-playbook -i inventories/production.ini playbooks/cluster-health.yml
-```
-
-**Example output:**
-```
-Node: rke2-master
-CPU Usage: 42.5%
-Memory Usage: 68.3%
-Disk Usage: 48%
-Containerd: active
-RKE2: active
-
-=== NODE STATUS ===
-rke2-master     True
-rke2-worker     True
-
-=== UNHEALTHY PODS ===
-Count: 0
-
-=== RECENT EVENTS ===
-...
-```
-
-## Roles (future structure)
-
-Roles organize playbooks by function. Create `roles/` subdirectories:
-
-| Role | Purpose |
-|---|---|
-| `security/` | Firewall, fail2ban, SELinux, audit logging |
-| `monitoring/` | Prometheus config, log aggregation setup |
-| `updates/` | Security patches, version upgrades |
-
-Currently playbooks are flat; move them into roles when complexity grows.
-
-## Extending Ansible
-
-### Add a new playbook
-
-1. Create `playbooks/my-playbook.yml`
-2. Define tasks, handlers, variables
-3. Test on `local.ini` first:
-   ```bash
-   ansible-playbook -i inventories/local.ini playbooks/my-playbook.yml
-   ```
-4. Run against production:
-   ```bash
-   ansible-playbook -i inventories/production.ini playbooks/my-playbook.yml
-   ```
-
-### Add a new host
-
-Update `inventories/production.ini`:
 ```ini
-[worker]
-rke2-worker-1  ansible_host=<IP>  ansible_user=rocky  ansible_ssh_private_key_file=~/.ssh/rke2-mumbai.pem
-rke2-worker-2  ansible_host=<IP>  ansible_user=rocky  ansible_ssh_private_key_file=~/.ssh/rke2-mumbai.pem
+rke2-worker ... ebs_volume_id=vol-021015865607ba4f4 ebs_size_gb=25
 ```
 
-Then target that host:
 ```bash
-ansible-playbook -i inventories/production.ini -l rke2-worker-2 playbooks/security-hardening.yml
+ansible-playbook playbooks/resize-disk.yml --limit worker
 ```
+
+Fully idempotent — re-running when already correct reports `changed=0` and skips
+the AWS call entirely, which also avoids tripping AWS's **~6 hour cooldown**
+between modifications of the same volume. gp3 resizes online, so no downtime.
+
+It detects the root device rather than assuming one: on t3 (Nitro) the kernel
+sees `/dev/nvme0n1p4` even though the AWS console reports `/dev/sda1`.
+
+### `security-hardening.yml` — verify by default, change on request
+
+`CLUSTER_GUIDE.md` §5 records that SELinux enforcing, key-only SSH and fail2ban
+are **already applied**. This is therefore a **drift detector**, not a first-time
+hardening run — so the default invocation changes nothing:
+
+```bash
+ansible-playbook playbooks/security-hardening.yml              # read-only audit
+ansible-playbook playbooks/security-hardening.yml --tags harden  # apply config
+ansible-playbook playbooks/security-hardening.yml --tags patch   # security errata only
+```
+
+Safety properties worth knowing:
+- `serial: 1` — never touches both cluster nodes at once
+- **Patching is security errata only**, and excludes `rke2-*`, `kernel*`,
+  `containerd*`. An unbounded `dnf update '*'` on a live Kubernetes node can pull
+  a new kernel or container runtime and take the control plane down.
+- **SELinux is reported, never flipped.** Changing it on a node already running
+  containerd/kubelet can trigger AVC denials against unlabelled files and needs a
+  relabel plus reboot — do that deliberately, not as a side effect.
+- sshd changes are validated with `sshd -t` before install and applied with
+  `reload`, not `restart`, so your current session survives.
+- Never auto-reboots; it reports when one is required.
+
+### `cluster-health.yml` — diagnostics
+
+```bash
+ansible-playbook playbooks/cluster-health.yml
+```
+
+Node metrics (CPU/memory/disk), RKE2 and containerd state, then Kubernetes-level
+checks from the master: node readiness, unhealthy pod count, PVs, memory pressure,
+recent events.
+
+Two Rocky/RKE2-specific details it gets right:
+- **containerd has no standalone systemd unit under RKE2** — it's a child of
+  `rke2-server`/`rke2-agent`, so the check probes the socket at
+  `/run/k3s/containerd/containerd.sock` instead of `systemctl is-active containerd`.
+- The Docker Compose monitoring check uses `become`, because `rocky` is
+  deliberately **not** in the `docker` group.
 
 ## Tips
 
-**Dry-run (check mode):**
 ```bash
-ansible-playbook -i inventories/production.ini playbooks/security-hardening.yml --check
-```
-Shows what *would* change without applying it.
-
-**Limit to one host:**
-```bash
-ansible-playbook -i inventories/production.ini playbooks/cluster-health.yml -l rke2-master
+ansible-playbook playbooks/<name>.yml --check      # dry run
+ansible-playbook playbooks/<name>.yml --limit worker
+ansible-playbook playbooks/<name>.yml -vvv         # verbose
 ```
 
-**Run with extra verbosity:**
-```bash
-ansible-playbook -i inventories/production.ini playbooks/cluster-health.yml -vvv
-```
+## Gotchas hit while building these
 
-**SSH key not in default location?**
-```bash
-ansible-playbook -i inventories/production.ini playbooks/security-hardening.yml \
-  -e "ansible_ssh_private_key_file=/path/to/key.pem"
-```
-
-## Security
-
-- **Inventories contain sensitive IPs** — git-ignore them if they ever contain secrets (they currently don't; passwords/keys are in keyfiles)
-- **SSH keys:** store in `~/.ssh/` with mode `0600`, never commit them
-- **Playbook outputs:** may contain IPs/versions in logs — be careful if sharing with others
-- **Idempotency:** all playbooks are idempotent (safe to re-run)
-
-## Next steps
-
-1. **Terraform for EC2 automation** — spin up/down nodes, manage security groups
-2. **GitOps loop** — a cron job that `ansible-playbook cluster-health.yml` and reports to a Slack channel
-3. **Pre-deploy validation** — run `--check` mode in CI before approving a deploy
+- A playbook file must be a **single YAML document**. A stray `---` mid-file makes
+  the whole file unparseable and *neither* play runs.
+- Rocky logs SSH auth to `/var/log/secure`, not Debian's `/var/log/auth.log` — the
+  fail2ban jail uses `backend = systemd` to sidestep the question entirely.
+- `kernel.unprivileged_userns_clone` is a **Debian kernel patch** and does not
+  exist on RHEL 9. Setting it aborts the play.
+- `systemctl is-active` prints `inactive` *and* returns non-zero, so `a || b`
+  chains emit both words. Use `--quiet`.

@@ -23,13 +23,25 @@
           register: disk_usage
           changed_when: false
 
+        # RKE2 does NOT run a standalone containerd.service — containerd is a
+        # child process of rke2-server/rke2-agent. Checking the unit would
+        # always report "not-running" and produce a false alarm; check the
+        # socket the runtime actually exposes instead.
         - name: Get container runtime status
-          shell: systemctl is-active containerd || echo "not-running"
+          shell: test -S /run/k3s/containerd/containerd.sock && echo active || echo missing
           register: containerd_status
           changed_when: false
 
+        # The master runs rke2-server, the worker runs rke2-agent. `systemctl
+        # is-active` PRINTS "inactive" as well as returning non-zero, so a
+        # naive `a || b` chain emits both words. Use --quiet and report only
+        # the unit that is actually up.
         - name: Get RKE2 status
-          shell: systemctl is-active rke2-server || systemctl is-active rke2-agent || echo "not-running"
+          shell: |
+            for unit in rke2-server rke2-agent; do
+              if systemctl is-active --quiet "$unit"; then echo "$unit active"; exit 0; fi
+            done
+            echo "not-running"
           register: rke2_status
           changed_when: false
 
@@ -71,8 +83,18 @@
           register: rke2_agent_status
           changed_when: false
 
+        # Needs become: the `rocky` user is deliberately NOT in the docker
+        # group, so without this the command fails and misreports the
+        # monitoring stack as "not-configured".
         - name: Check Docker Compose services
-          shell: docker compose -f /opt/monitoring/docker-compose.yml ps 2>/dev/null || echo "not-configured"
+          become: true
+          shell: |
+            if [ -f /opt/monitoring/docker-compose.yml ]; then
+              docker compose -f /opt/monitoring/docker-compose.yml ps --format '{{ "{{" }}.Name{{ "}}" }} {{ "{{" }}.State{{ "}}" }}' 2>/dev/null \
+                || echo "compose present but not queryable"
+            else
+              echo "not-configured"
+            fi
           register: docker_status
           changed_when: false
 
@@ -80,11 +102,15 @@
           debug:
             msg: |
               Worker Service Status: {{ rke2_agent_status.status.ActiveState }}
-              Docker Compose Running: {{ docker_status.stdout_lines | first }}
+              Docker Compose ({{ docker_status.stdout_lines | length }} containers):
+                {{ docker_status.stdout_lines | join('
+                ') }}
       when: inventory_hostname in groups['worker']
 
----
-# Run Kubernetes-level checks from master
+# Run Kubernetes-level checks from master.
+# NOTE: no `---` here. A playbook file must be a SINGLE YAML document holding a
+# list of plays; a second document separator makes the whole file unparseable,
+# so neither play would run.
 - name: Kubernetes cluster diagnostics
   hosts: master
   gather_facts: no
