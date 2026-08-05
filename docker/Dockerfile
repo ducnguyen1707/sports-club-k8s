@@ -61,6 +61,8 @@ RUN rm -f '/var/www/html/sports_club_db.sql' \
 COPY docker/php-overrides/db_conn.php /var/www/html/include/db_conn.php
 COPY docker/php-overrides/connect.php /var/www/html/connect.php
 COPY docker/php-overrides/zz-app.ini  /usr/local/etc/php/conf.d/zz-app.ini
+# Probe endpoint — see the file header for why probes must not hit index.php
+COPY docker/php-overrides/healthz.php /var/www/html/healthz.php
 
 RUN chown -R www-data:www-data /var/www/html
 

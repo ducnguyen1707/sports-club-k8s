@@ -42,10 +42,10 @@ spec:
             requests: { cpu: 50m,  memory: 96Mi }
             limits:   { cpu: 200m, memory: 256Mi }
           readinessProbe:
-            httpGet: { path: /index.php, port: 80 }
+            httpGet: { path: /healthz.php, port: 80 }
             initialDelaySeconds: 5
             periodSeconds: 10
           livenessProbe:
-            httpGet: { path: /index.php, port: 80 }
+            httpGet: { path: /healthz.php, port: 80 }
             initialDelaySeconds: 20
             periodSeconds: 20

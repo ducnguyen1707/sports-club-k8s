@@ -9,7 +9,10 @@ resources:
   - redis.yaml
   - app-deployment.yaml
   - app-service.yaml
-  - app-ingress.yaml
+  # app-ingress.yaml intentionally NOT applied — Ingress is deferred.
+  # Access with: kubectl -n sports-club port-forward svc/sports-club-app 8080:80
+  # The smoke test is unaffected: it runs from a probe pod against in-cluster
+  # Service DNS, not through the Ingress.
   - app-hpa.yaml
   - app-pdb.yaml
 

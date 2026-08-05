@@ -41,6 +41,9 @@ k8s/
   secret-template.yaml  never commit a filled-in copy
   base/                 kustomize base
   overlays/production/  hostname + image tag
+ansible/
+  playbooks/            resize-disk, security-hardening (verify-first), cluster-health
+  inventories/          per-node EBS sizing lives here
 monitoring/
   README.md             how to wire MySQL metrics into the existing stack
   mysql-alerts.yml      Prometheus alert rules for MySQL
@@ -95,8 +98,16 @@ gh secret set KUBE_CONFIG                 # paste it
 
 # 6. wire MySQL metrics into the existing Prometheus — see monitoring/README.md
 
-Then set your hostname in `k8s/overlays/production/kustomization.yaml`.
-For testing without DNS, `nip.io` works: `sportsclub.<worker-ip>.nip.io`.
+**Ingress is currently deferred** — reach the app with a port-forward:
+
+```bash
+kubectl -n sports-club port-forward svc/sports-club-app 8080:80
+```
+
+To enable Ingress later, re-add `app-ingress.yaml` to `k8s/base/kustomization.yaml`
+and set a hostname. `rke2-ingress-nginx` runs on both nodes, so pointing the
+hostname at the master's Elastic IP is stable even though the app runs on the
+worker (whose public IP changes on restart).
 
 Manual deploy (CI does this automatically on `main`):
 ```bash
@@ -138,22 +149,42 @@ HPA 2→4 replicas at 70% CPU, `maxUnavailable: 0` for zero-downtime rollouts,
 restarts — i.e. on *every deploy*. Redis costs one 32Mi pod and makes rolling
 updates actually seamless.
 
-### Honest ceiling on this cluster
-| Node | Free | Usable for app pods |
-|---|---|---|
-| master | ~155m CPU | effectively none — control plane + Longhorn |
-| worker | ~725m CPU, ~2.2Gi | MySQL + Redis + roughly **3** app pods |
+### Capacity — measured against requests, not limits
 
-So `maxReplicas: 4` is aspirational. **A third node is the real scale-out
-path** — it also restores etcd quorum and lets Longhorn use 3-way replication.
+The **scheduler admits on `requests`**, so that is what determines whether pods fit:
+
+| | CPU requests | Memory requests |
+|---|---|---|
+| MySQL + mysqld_exporter + Redis | 120m | 312Mi |
+| 4 × app pods (HPA ceiling) | 200m | 384Mi |
+| **Total** | **320m** of ~725m free | **696Mi** of ~2.2Gi free |
+
+`maxReplicas: 4` fits comfortably. (An earlier version of this README said
+"roughly 3 app pods" — that was computed from *limits* and was wrong.)
+
+The master is the constrained node at ~155m CPU free, so app pods should stay on
+the worker. **A third node remains the real scale-out path** — it also restores
+etcd quorum and lets Longhorn use 3-way replication.
 
 **MySQL stays at 1 replica.** Horizontal MySQL means replication and read/write
 splitting the app doesn't support. Scale vertically first; this CRUD app won't
 outgrow one pod for a long time. It is a single point of failure — mitigate
 with etcd/Longhorn backups, not by pretending otherwise.
 
-Longhorn PVC is **1Gi** deliberately: the worker only has ~2Gi of Longhorn
-space free, and every volume needs a replica on both nodes.
+**Worker disk was the binding constraint and has been resolved.** At 15 GB it sat
+at 83% used, leaving only ~300 MB above Longhorn's
+`storageMinimalAvailablePercentage: 15` floor — pulling the ~480 MB image would
+have dropped it below, making Longhorn mark the node unschedulable so that *no*
+volume could be created. Resized to **25 GB** via
+`ansible/playbooks/resize-disk.yml`:
+
+| | Before | After |
+|---|---|---|
+| Worker filesystem | 14G, 2.4G free (84%) | 24G, 13G free (49%) |
+| Longhorn available on worker | 2 Gi | **12.11 Gi** |
+
+To grow it again, change `ebs_size_gb` in `ansible/inventories/production.ini`
+and re-run the playbook.
 
 ---
 

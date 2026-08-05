@@ -3,14 +3,20 @@ name: build-and-deploy
 on:
   push:
     branches: [main]
+    # Documentation and playbook changes don't affect the image or manifests,
+    # so they shouldn't burn a full build + scan cycle.
+    paths-ignore: ['**.md', 'ansible/**', 'monitoring/**', 'LICENSE']
   pull_request:
     branches: [main]
+    paths-ignore: ['**.md', 'ansible/**', 'monitoring/**', 'LICENSE']
   workflow_dispatch:
 
-# Cancel superseded runs on the same ref — saves runner time on rapid pushes.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Cancel superseded runs on branches, but NEVER on main: cancelling there can
+  # kill a deploy between `kubectl apply` and `rollout status`, leaving the
+  # cluster half-updated with nothing watching it.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 # NOTE ON `runs-on: ubuntu-latest` BELOW:
 # That is GitHub's HOSTED CI RUNNER — a throwaway VM at GitHub that builds the
@@ -40,44 +46,11 @@ jobs:
         run: |
           set -eu
           fail=0
-          # Note: -print0/-0 because upstream has filenames with spaces
           while IFS= read -r -d '' f; do
             php -l "$f" >/dev/null || { echo "SYNTAX ERROR: $f"; fail=1; }
           done < <(find app/Files docker/php-overrides -name '*.php' -print0)
           [ "$fail" -eq 0 ] && echo "All PHP files parse cleanly."
           exit "$fail"
-
-  # ---------------------------------------------------------------------------
-  # SAST: Static Application Security Testing with SonarQube/SonarCloud.
-  # Scan the PHP code for bugs, security vulnerabilities, code smells.
-  # Runs AFTER lint but doesn't block build (you can configure gating in
-  # SonarCloud settings once you've established a baseline).
-  # ---------------------------------------------------------------------------
-  scan-code:
-    runs-on: ubuntu-latest
-    needs: lint
-    # Only scan on main to avoid quota burn on every PR
-    if: github.ref == 'refs/heads/main'
-    steps:
-      - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }  # Full history for SonarQube to detect deletions
-
-      - name: SonarCloud Scan
-        uses: SonarSource/sonarcloud-github-action@master
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}  # Get from sonarcloud.io after signup
-        with:
-          args: >
-            -Dsonar.projectKey=sports-club-k8s
-            -Dsonar.organization=your-org
-
-      # Optional: fail the job if quality gate fails (set in SonarCloud UI)
-      # Remove this if you want scans to be informational only
-      - name: Check SonarQube quality gate
-        run: |
-          echo "Quality gate result available at SonarCloud dashboard"
-          echo "Configure 'fail pipeline' in SonarCloud project settings if desired"
 
   # ---------------------------------------------------------------------------
   # Manifests must render before we bother building an image.
@@ -90,6 +63,33 @@ jobs:
         with: { version: v1.35.6 }
       - name: kustomize build
         run: kubectl kustomize k8s/overlays/production > /dev/null && echo "manifests OK"
+
+  # ---------------------------------------------------------------------------
+  # SAST. OPT-IN: runs only when the repo variable ENABLE_SONAR is "true", so
+  # main stays green until SonarCloud is actually set up. To enable:
+  #     gh variable set ENABLE_SONAR --body true
+  #     gh variable set SONAR_ORGANIZATION --body <your-org-key>
+  #     gh secret   set SONAR_TOKEN
+  # ---------------------------------------------------------------------------
+  scan-code:
+    runs-on: ubuntu-latest
+    needs: lint
+    if: github.ref == 'refs/heads/main' && vars.ENABLE_SONAR == 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }   # full history so Sonar can attribute changes
+
+      # NB: SonarSource/sonarcloud-github-action is ARCHIVED and deprecated —
+      # sonarqube-scan-action is its replacement.
+      - name: SonarQube scan
+        uses: SonarSource/sonarqube-scan-action@v8.2.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.projectKey=sports-club-k8s
+            -Dsonar.organization=${{ vars.SONAR_ORGANIZATION }}
 
   # ---------------------------------------------------------------------------
   # Build on a GitHub-hosted runner: free (unlimited on public repos) and it's
@@ -129,60 +129,59 @@ jobs:
           cache-to: type=gha,mode=max
 
   # ---------------------------------------------------------------------------
-  # DAST: Scan the built container image for known vulnerabilities.
-  # Uses Trivy (Open Source Container Scanner from Aqua Security).
-  # Scans for CVEs in base image, installed packages, app dependencies.
-  # Generates SBOM (Software Bill of Materials) for supply chain security.
-  # Runs AFTER build but BEFORE deploy — gates deploy if CRITICAL found.
+  # Scan the built image for CVEs and emit an SBOM.
   # ---------------------------------------------------------------------------
   scan-image:
     runs-on: ubuntu-latest
     needs: build
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      packages: read           # Trivy must PULL the image from GHCR
+      security-events: write   # required by upload-sarif, else it 403s
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@master
+      # New GHCR packages are private by default, so Trivy cannot pull
+      # anonymously — authenticate before scanning.
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ env.IMAGE }}:${{ needs.build.outputs.tag }}
-          format: 'sarif'
-          output: 'trivy-results.sarif'
+          format: sarif
+          output: trivy-results.sarif
           severity: 'CRITICAL,HIGH'
-          # Ignore vulnerabilities listed in .trivyignore (checked into repo)
-          ignorefile: '.trivyignore'
+          trivyignores: .trivyignore
 
-      - name: Upload Trivy SARIF to GitHub Security tab
-        uses: github/codeql-action/upload-sarif@v2
+      - name: Upload SARIF to the Security tab
+        uses: github/codeql-action/upload-sarif@v3
         if: always()
         with:
-          sarif_file: 'trivy-results.sarif'
-          category: 'trivy'
+          sarif_file: trivy-results.sarif
+          category: trivy
 
-      - name: Run Trivy SBOM generation
-        uses: aquasecurity/trivy-action@master
+      - name: Generate SBOM
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ env.IMAGE }}:${{ needs.build.outputs.tag }}
-          format: 'cyclonedx'
-          output: 'sbom.json'
+          format: cyclonedx
+          output: sbom.json
 
-      - name: Upload SBOM artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: sbom-${{ needs.build.outputs.tag }}
           path: sbom.json
           retention-days: 90
 
-      - name: Check Trivy results
-        run: |
-          echo "Image scan complete. Review results in:"
-          echo "  GitHub Security tab (SARIF upload)"
-          echo "  Artifacts (SBOM)"
-          echo "If CRITICAL vulnerabilities exist, review before deploying."
-
   # ---------------------------------------------------------------------------
-  # Deploy. Requires KUBE_CONFIG secret — a kubeconfig for the NAMESPACE-SCOPED
+  # Deploy. Requires KUBE_CONFIG — a kubeconfig for the NAMESPACE-SCOPED
   # ServiceAccount (see README), not a cluster-admin one. If that credential
   # leaks, the blast radius is the sports-club namespace only.
   # ---------------------------------------------------------------------------
@@ -216,7 +215,6 @@ jobs:
         run: |
           kustomize edit set image \
             "ghcr.io/OWNER/sports-club=${IMAGE}:${{ needs.build.outputs.tag }}"
-          echo "--- resulting image ---"
           kustomize build . | grep 'image: ghcr.io'
 
       - name: Apply
