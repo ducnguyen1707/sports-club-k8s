@@ -15,13 +15,23 @@ spec:
     metadata:
       labels: { app: sports-club-app }
     spec:
-      # Spread replicas across nodes so one node loss doesn't take everything.
-      topologySpreadConstraints:
-        - maxSkew: 1
-          topologyKey: kubernetes.io/hostname
-          whenUnsatisfiable: ScheduleAnyway
-          labelSelector:
-            matchLabels: { app: sports-club-app }
+      # Prefer the worker, but don't require it.
+      #
+      # This replaced a topologySpreadConstraint. Spreading actively pushed
+      # replicas ONTO the master, taking it to 97% CPU requested — and it
+      # bought no real availability, because MySQL is a single replica pinned
+      # to the worker, so a worker loss is a full outage either way.
+      # Soft preference keeps the control plane clear while still letting the
+      # HPA burst onto the master rather than sit Pending.
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: node-role.kubernetes.io/worker
+                    operator: In
+                    values: ["true"]
       containers:
         - name: app
           image: ghcr.io/OWNER/sports-club:latest   # overwritten by CI

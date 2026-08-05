@@ -13,6 +13,9 @@ spec:
     metadata:
       labels: { app: redis }
     spec:
+      # Same reasoning as MySQL — keep it off the control plane.
+      nodeSelector:
+        node-role.kubernetes.io/worker: "true"
       containers:
         - name: redis
           image: redis:7-alpine

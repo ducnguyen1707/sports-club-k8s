@@ -3,8 +3,23 @@ kind: Service
 metadata:
   name: sports-club-app
 spec:
-  type: ClusterIP           # reached via Ingress only
+  # NodePort for a domain-free demo URL.
+  #
+  # Chosen over an Ingress deliberately: the security group already permits
+  # 30000-32767 inbound, but NOT port 80 — so this needs no firewall change,
+  # whereas an Ingress would. kube-proxy forwards from ANY node, so the
+  # master's stable Elastic IP works even though the pods run on the worker
+  # (the worker has no EIP and its public address changes on every restart).
+  #
+  # A NodePort still has a ClusterIP, so in-cluster DNS and the smoke tests
+  # are unaffected.
+  #
+  # NOTE: this puts the login page on the public internet. Change the default
+  # admin password immediately, and prefer an Ingress + TLS for anything
+  # beyond a demo.
+  type: NodePort
   selector: { app: sports-club-app }
   ports:
     - port: 80
       targetPort: 80
+      nodePort: 30080

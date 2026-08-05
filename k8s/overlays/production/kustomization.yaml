@@ -7,8 +7,8 @@ resources:
 # CI rewrites the newTag here via `kustomize edit set image`.
 images:
   - name: ghcr.io/OWNER/sports-club
-    newName: ghcr.io/OWNER/sports-club
-    newTag: latest
+    newName: ghcr.io/ducnguyen1707/sports-club
+    newTag: ef14c0a
 
 # Set your real hostname here. For testing without DNS, nip.io works:
 #   sportsclub.<worker-ip>.nip.io

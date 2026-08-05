@@ -50,9 +50,19 @@
       changed_when: false
       failed_when: false
 
+    # firewalld is deliberately MASKED on this cluster - the network boundary
+    # is the AWS security group, not a host firewall. Report enabled-state too,
+    # so a masked unit reads as an intentional decision rather than drift. An
+    # audit that cries wolf on every run stops being read.
     - name: Check firewalld service state
       ansible.builtin.command: systemctl is-active firewalld
       register: firewalld_state
+      changed_when: false
+      failed_when: false
+
+    - name: Check whether firewalld is masked
+      ansible.builtin.command: systemctl is-enabled firewalld
+      register: firewalld_enabled
       changed_when: false
       failed_when: false
 
@@ -68,7 +78,11 @@
           - "host                  : {{ inventory_hostname }}"
           - "SELinux               : {{ selinux_mode.stdout | default('unknown') }}   (want Enforcing)"
           - "fail2ban              : {{ fail2ban_state.stdout | default('unknown') }}   (want active)"
-          - "firewalld             : {{ firewalld_state.stdout | default('unknown') }}   (want active)"
+          - >-
+            firewalld             : {{ firewalld_state.stdout | default('unknown') }}
+            ({{ 'masked - intentional, AWS security group is the boundary'
+                if firewalld_enabled.stdout | default('') == 'masked'
+                else 'want active' }})
           - "pending security errata: {{ pending_security.stdout | default('?') | trim }}"
           - "sshd effective config :"
           - "{{ sshd_effective.stdout_lines | default([]) }}"
