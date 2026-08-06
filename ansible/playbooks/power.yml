@@ -1,0 +1,148 @@
+---
+# ---------------------------------------------------------------------------
+# Start or stop the whole cluster.
+#
+#   ansible-playbook playbooks/power.yml -e state=started
+#   ansible-playbook playbooks/power.yml -e state=stopped
+#
+# WHY THE FIRST PLAY USES connection: local
+# Ansible normally SSHes into its targets — but a STOPPED EC2 instance has
+# nothing listening, so any SSH-based task fails before it starts. Powering an
+# instance on is an AWS API call, not something you do "on" the box. So play 1
+# runs locally against the AWS API, and only play 2 (which needs a live host)
+# uses the real SSH connection.
+#
+# Instance IDs come from the inventory (ec2_instance_id), so adding a third
+# node means adding one line there — no playbook change.
+# ---------------------------------------------------------------------------
+- name: "Power {{ state | default('started') }} the cluster nodes"
+  hosts: cluster
+  connection: local            # a stopped host cannot be SSHed into
+  gather_facts: false
+
+  vars:
+    state: started             # override with -e state=stopped
+
+  tasks:
+    - name: Validate the requested state
+      ansible.builtin.assert:
+        that: state in ['started', 'stopped']
+        fail_msg: "state must be 'started' or 'stopped' (got '{{ state }}')"
+      run_once: true
+
+    - name: Collect every instance ID in the inventory
+      ansible.builtin.set_fact:
+        ids: >-
+          {{ groups['cluster']
+             | map('extract', hostvars, 'ec2_instance_id')
+             | select('defined') | list }}
+      run_once: true
+
+    - name: Show current states
+      ansible.builtin.command: >-
+        aws ec2 describe-instances --region {{ aws_region }}
+        --instance-ids {{ ids | join(' ') }}
+        --query 'Reservations[].Instances[].[InstanceId,State.Name]' --output text
+      register: before
+      changed_when: false
+      run_once: true
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: "before: {{ before.stdout_lines }}"
+      run_once: true
+
+    - name: "Issue {{ state }}"
+      ansible.builtin.command: >-
+        aws ec2 {{ 'start-instances' if state == 'started' else 'stop-instances' }}
+        --region {{ aws_region }} --instance-ids {{ ids | join(' ') }}
+      run_once: true
+      # Skip when every instance is already in the target state — keeps the
+      # playbook idempotent and avoids pointless API calls.
+      when: >-
+        before.stdout_lines | select('search', state) | list | length
+        < ids | length
+      register: power_action
+
+    - name: Wait for the requested state to be reached
+      ansible.builtin.command: >-
+        aws ec2 wait instance-{{ 'running' if state == 'started' else 'stopped' }}
+        --region {{ aws_region }} --instance-ids {{ ids | join(' ') }}
+      changed_when: false
+      run_once: true
+
+    - name: Report new public addresses
+      ansible.builtin.command: >-
+        aws ec2 describe-instances --region {{ aws_region }}
+        --instance-ids {{ ids | join(' ') }}
+        --query 'Reservations[].Instances[].[InstanceId,State.Name,PublicIpAddress]'
+        --output text
+      register: after
+      changed_when: false
+      run_once: true
+
+    - name: Result
+      ansible.builtin.debug:
+        msg: "after: {{ after.stdout_lines }}"
+      run_once: true
+
+# ---------------------------------------------------------------------------
+# Only meaningful when starting: wait for SSH and confirm the cluster is up.
+# ---------------------------------------------------------------------------
+- name: Wait for the nodes to be usable
+  hosts: cluster
+  gather_facts: false
+  vars:
+    state: started
+  tasks:
+    - name: Wait for SSH to answer
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+        sleep: 5
+      when: state == 'started'
+
+    - name: Wait for RKE2 to be active
+      ansible.builtin.shell: |
+        for unit in rke2-server rke2-agent; do
+          systemctl is-active --quiet "$unit" && { echo "$unit active"; exit 0; }
+        done
+        exit 1
+      become: true
+      register: rke2_up
+      until: rke2_up.rc == 0
+      retries: 30
+      delay: 10
+      changed_when: false
+      when: state == 'started'
+
+    - name: Node status
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ rke2_up.stdout | default('n/a') }}"
+      when: state == 'started'
+
+- name: Confirm Kubernetes sees both nodes Ready
+  hosts: master
+  gather_facts: false
+  vars:
+    state: started
+  tasks:
+    - name: Wait for all nodes Ready
+      ansible.builtin.shell: |
+        export PATH=$PATH:/var/lib/rancher/rke2/bin
+        export KUBECONFIG=/etc/rancher/rke2/rke2.yaml
+        total=$(kubectl get nodes --no-headers | wc -l)
+        ready=$(kubectl get nodes --no-headers | grep -cw Ready)
+        echo "$ready/$total Ready"
+        [ "$ready" = "$total" ]
+      become: true
+      register: nodes_ready
+      until: nodes_ready.rc == 0
+      retries: 40
+      delay: 15
+      changed_when: false
+      when: state == 'started'
+
+    - name: Cluster status
+      ansible.builtin.debug:
+        msg: "cluster: {{ nodes_ready.stdout | default('n/a') }}"
+      when: state == 'started'

@@ -1,0 +1,88 @@
+# ---------------------------------------------------------------------------
+# Read-only cluster access for a mentor / reviewer.
+#
+#   kubectl apply -f k8s/mentor-rbac.yaml
+#   bash ci/gen-mentor-kubeconfig.sh > mentor.kubeconfig
+#
+# WHY NOT JUST HAND OVER /etc/rancher/rke2/rke2.yaml
+# That file is cluster-admin. It can read every Secret (MySQL root password,
+# the CI deploy token), delete any namespace, and it CANNOT BE REVOKED without
+# rotating the cluster CA. A ServiceAccount is revocable: delete the token
+# Secret and access stops immediately.
+#
+# SCOPE: read-only everywhere, no write verbs anywhere, no Secret access.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mentor-access
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mentor
+  namespace: mentor-access
+---
+# The built-in "view" ClusterRole covers namespaced resources (pods,
+# deployments, services, logs, events...) and DELIBERATELY excludes Secrets.
+# It does not, however, cover cluster-scoped resources — hence the role below.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: mentor-view
+subjects:
+  - kind: ServiceAccount
+    name: mentor
+    namespace: mentor-access
+roleRef:
+  kind: ClusterRole
+  name: view
+  apiGroup: rbac.authorization.k8s.io
+---
+# Cluster-scoped read that "view" omits: without this the mentor cannot even
+# run `kubectl get nodes`, which is the first thing anyone reviewing a cluster
+# tries. Read verbs only — no create/update/patch/delete anywhere.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mentor-cluster-reader
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "persistentvolumes", "namespaces", "events", "componentstatuses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses", "volumeattachments", "csidrivers", "csinodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["nodes", "pods"]
+    verbs: ["get", "list"]            # enables `kubectl top`
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["longhorn.io"]        # so they can inspect the storage layer
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: mentor-cluster-reader
+subjects:
+  - kind: ServiceAccount
+    name: mentor
+    namespace: mentor-access
+roleRef:
+  kind: ClusterRole
+  name: mentor-cluster-reader
+  apiGroup: rbac.authorization.k8s.io
+---
+# k8s 1.24+ stopped auto-creating ServiceAccount token Secrets, so request one.
+# Revoke access by deleting THIS Secret.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mentor-token
+  namespace: mentor-access
+  annotations:
+    kubernetes.io/service-account.name: mentor
+type: kubernetes.io/service-account-token
