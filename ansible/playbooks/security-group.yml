@@ -1,0 +1,99 @@
+---
+# ---------------------------------------------------------------------------
+# Declare the inbound rules the cluster's security group must have.
+#
+#   ansible-playbook playbooks/security-group.yml
+#   ansible-playbook playbooks/security-group.yml --check   # show drift only
+#
+# Runs entirely against the AWS API (connection: local) — it never touches the
+# nodes, and works whether they are running or stopped.
+#
+# Idempotent: it reads the current rules first and only authorises what is
+# genuinely missing. Re-running reports changed=0.
+#
+# NOTE: this ADDS missing rules; it deliberately does not remove extra ones.
+# Revoking a rule you did not expect is exactly how you lock yourself out of
+# port 22 — so unexpected rules are reported for a human to judge, not deleted.
+# ---------------------------------------------------------------------------
+- name: Ensure the cluster security group has the required inbound rules
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    aws_region: ap-south-1
+    security_group_id: sg-06d9dd07a9fb09a53
+
+    # The full set of ports that should be reachable from outside.
+    # To change what is exposed, edit THIS list and re-run.
+    required_ingress:
+      - { port: 22,   cidr: "0.0.0.0/0", desc: "SSH" }
+      - { port: 6443, cidr: "0.0.0.0/0", desc: "Kubernetes API" }
+      - { port: 9345, cidr: "0.0.0.0/0", desc: "RKE2 node registration" }
+      # 80 is NOT optional and must stay open permanently: Let's Encrypt's
+      # HTTP-01 challenge is fetched from arbitrary global IPs, and cert-manager
+      # renews unattended at ~60 days. Closing it makes renewal fail silently
+      # until the certificate expires and the site breaks.
+      - { port: 80,   cidr: "0.0.0.0/0", desc: "HTTP - ACME HTTP-01 + redirect to HTTPS" }
+      - { port: 443,  cidr: "0.0.0.0/0", desc: "HTTPS" }
+
+  tasks:
+    - name: Read the current inbound rules
+      ansible.builtin.command: >-
+        aws ec2 describe-security-groups
+        --region {{ aws_region }}
+        --group-ids {{ security_group_id }}
+        --query 'SecurityGroups[0].IpPermissions[?IpProtocol==`tcp`].[FromPort,ToPort,IpRanges[0].CidrIp]'
+        --output text
+      register: current_rules
+      changed_when: false
+
+    - name: Build the set of ports already covered
+      ansible.builtin.set_fact:
+        # A rule covers a port if the port falls inside its FromPort-ToPort
+        # range with a matching CIDR — the NodePort rule is a range, not a
+        # single port, so an exact-match comparison would be wrong.
+        covered_ports: >-
+          {{ current_rules.stdout_lines
+             | map('split', '\t')
+             | selectattr('2', 'defined')
+             | list }}
+
+    - name: Show what is currently open
+      ansible.builtin.debug:
+        msg: "existing tcp rules: {{ current_rules.stdout_lines }}"
+
+    - name: Authorise any missing rule
+      ansible.builtin.command: >-
+        aws ec2 authorize-security-group-ingress
+        --region {{ aws_region }}
+        --group-id {{ security_group_id }}
+        --ip-permissions
+        'IpProtocol=tcp,FromPort={{ item.port }},ToPort={{ item.port }},IpRanges=[{CidrIp={{ item.cidr }},Description="{{ item.desc }}"}]'
+      loop: "{{ required_ingress }}"
+      loop_control:
+        label: "{{ item.port }}/tcp {{ item.cidr }} ({{ item.desc }})"
+      register: authorize
+      # Already-present rules make the API return InvalidPermission.Duplicate.
+      # Treat that as success so the play stays idempotent.
+      failed_when:
+        - authorize.rc != 0
+        - "'InvalidPermission.Duplicate' not in authorize.stderr"
+      changed_when:
+        - authorize.rc == 0
+
+    - name: Re-read the rules
+      ansible.builtin.command: >-
+        aws ec2 describe-security-groups
+        --region {{ aws_region }}
+        --group-ids {{ security_group_id }}
+        --query 'SecurityGroups[0].IpPermissions[?IpProtocol==`tcp`].[FromPort,ToPort,IpRanges[0].CidrIp]'
+        --output text
+      register: final_rules
+      changed_when: false
+
+    - name: Result
+      ansible.builtin.debug:
+        msg:
+          - "security group : {{ security_group_id }}"
+          - "inbound tcp now : {{ final_rules.stdout_lines }}"

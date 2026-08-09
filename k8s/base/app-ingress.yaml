@@ -4,8 +4,23 @@ metadata:
   name: sports-club-app
   annotations:
     nginx.ingress.kubernetes.io/proxy-body-size: "8m"
+    # Force HTTP -> HTTPS. ingress-nginx still serves the ACME challenge path
+    # over plain HTTP regardless, so this does not break renewal.
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    # cert-manager watches this annotation, provisions a Certificate, solves
+    # HTTP-01 via a temporary Ingress, and writes the secret named in tls[].
+    #
+    # STAGING while proving the flow. Let's Encrypt production allows only 5
+    # failed validations per hostname per hour, so debugging DNS or firewall
+    # problems against prod can lock you out. Flip to letsencrypt-prod in the
+    # production overlay once a staging cert issues successfully.
+    cert-manager.io/cluster-issuer: letsencrypt-staging
 spec:
   ingressClassName: nginx      # rke2-ingress-nginx, already running
+  tls:
+    - hosts:
+        - sportsclub.local     # overridden per-overlay
+      secretName: sports-club-tls   # created by cert-manager; do not hand-manage
   rules:
     - host: sportsclub.local   # overridden per-overlay
       http:

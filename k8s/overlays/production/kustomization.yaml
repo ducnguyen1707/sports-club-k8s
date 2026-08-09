@@ -10,6 +10,17 @@ images:
     newName: ghcr.io/ducnguyen1707/sports-club
     newTag: ef14c0a
 
-# Set your real hostname here. For testing without DNS, nip.io works:
-#   sportsclub.<worker-ip>.nip.io
-# No Ingress patch: the Ingress is deferred (see base/kustomization.yaml).
+# Real hostname for this environment. The base stays environment-agnostic;
+# only this overlay knows the public name — the same pattern used for the
+# image tag above.
+patches:
+  - target:
+      kind: Ingress
+      name: sports-club-app
+    patch: |-
+      - op: replace
+        path: /spec/rules/0/host
+        value: sportsclub.adminabc.click
+      - op: replace
+        path: /spec/tls/0/hosts/0
+        value: sportsclub.adminabc.click

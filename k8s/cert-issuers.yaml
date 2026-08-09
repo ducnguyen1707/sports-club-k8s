@@ -1,0 +1,55 @@
+# ---------------------------------------------------------------------------
+# Let's Encrypt ClusterIssuers.
+#
+#   kubectl apply -f k8s/cert-issuers.yaml
+#
+# Applied SEPARATELY from the kustomize build, not as part of it. Kustomize
+# applies everything in a single pass, and a ClusterIssuer cannot be created
+# until cert-manager's CRDs are *established* — mixing them causes a race that
+# fails on a fresh cluster. cert-manager itself is installed once with:
+#
+#   kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.21.1/cert-manager.yaml
+#
+# ---------------------------------------------------------------------------
+# ALWAYS TEST WITH STAGING FIRST.
+#
+# Let's Encrypt production enforces 5 failed validations per hostname per hour
+# and 50 certificates per domain per week. A DNS typo or a closed port 80 can
+# burn through that in minutes and lock you out for an hour with no recourse.
+# Staging has identical mechanics and generous limits; its certificate is
+# untrusted by browsers, which is fine — it proves the *flow* works. Then flip
+# the Ingress annotation to letsencrypt-prod.
+# ---------------------------------------------------------------------------
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-staging
+spec:
+  acme:
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    email: ducngitech@gmail.com          # expiry notices only
+    privateKeySecretRef:
+      name: letsencrypt-staging-account   # ACME account key, created by cert-manager
+    solvers:
+      # HTTP-01, NOT DNS-01. DNS-01 would require an API credential for the DNS
+      # provider; this domain is hosted at INET, which has no cert-manager
+      # webhook. HTTP-01 needs only a working A record plus port 80 reachable
+      # from the public internet.
+      - http01:
+          ingress:
+            ingressClassName: nginx
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: ducngitech@gmail.com
+    privateKeySecretRef:
+      name: letsencrypt-prod-account
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: nginx
